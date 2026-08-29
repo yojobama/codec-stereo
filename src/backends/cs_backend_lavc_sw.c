@@ -22,6 +22,7 @@
  */
 
 #include "codec_stereo/cs.h"
+#include "codec_stereo/cs_util.h"
 #include "cs_backend.h"
 
 #include <libavcodec/avcodec.h>
@@ -38,6 +39,9 @@ typedef struct lavc_sw_ctx {
     int merange;          /* x264 has one scalar search range, not separate x/y */
     int subpel_enabled;
     int qp;
+    char me[8];            /* x264 "me" method: esa (exhaustive, default) or a
+                               faster heuristic (umh/hex/dia) for large merange,
+                               where esa's O(merange^2) cost becomes intractable */
     int32_t disparity_offset;
 
     int cols, rows;
@@ -46,8 +50,8 @@ typedef struct lavc_sw_ctx {
     uint8_t *flags;
 } lavc_sw_ctx;
 
-/* Parses a minimal "key=value;key2=value2" string looking for integer
-   overrides this backend recognizes. Unknown keys are ignored. */
+/* Parses a minimal "key=value;key2=value2" string looking for overrides
+   this backend recognizes. Unknown keys are ignored. */
 static void apply_backend_params(lavc_sw_ctx *ctx, const char *params) {
     if (!params) return;
     char buf[256];
@@ -60,6 +64,10 @@ static void apply_backend_params(lavc_sw_ctx *ctx, const char *params) {
         *eq = '\0';
         const char *key = tok, *val = eq + 1;
         if (strcmp(key, "qp") == 0) ctx->qp = atoi(val);
+        else if (strcmp(key, "me") == 0) {
+            strncpy(ctx->me, val, sizeof ctx->me - 1);
+            ctx->me[sizeof ctx->me - 1] = '\0';
+        }
     }
 }
 
@@ -101,6 +109,8 @@ static int lavc_sw_init(void *vctx, const cs_config *cfg) {
     ctx->disparity_offset = cfg->disparity_offset;
     ctx->qp = 10; /* low QP shrinks the MV-cost/lambda term vs SAD, reducing
                      the predictor smoothing bias -- see Docs Sec. "Phase 1" */
+    strncpy(ctx->me, "esa", sizeof ctx->me - 1); /* exhaustive; O(merange^2),
+        override to umh/hex/dia via backend_params for large merange */
 
     apply_backend_params(ctx, cfg->backend_params);
     return 0;
@@ -187,6 +197,7 @@ static int lavc_sw_extract(void *vctx, const cs_frame *left, const cs_frame *rig
     AVCodecContext *enc_ctx = NULL, *dec_ctx = NULL;
     AVFrame *fl = NULL, *fr = NULL, *dec_frame = NULL;
     AVPacket *pkt = NULL;
+    uint8_t *right_shifted_buf = NULL;
 
     const AVCodec *enc_codec = avcodec_find_encoder_by_name("libx264");
     const AVCodec *dec_codec = avcodec_find_decoder(AV_CODEC_ID_H264);
@@ -204,10 +215,10 @@ static int lavc_sw_extract(void *vctx, const cs_frame *left, const cs_frame *rig
     {
         char params[256];
         snprintf(params, sizeof params,
-                  "qp=%d:me=esa:merange=%d:subme=%d:partitions=none:ref=1:"
+                  "qp=%d:me=%s:merange=%d:subme=%d:partitions=none:ref=1:"
                   "bframes=0:rc-lookahead=0:mbtree=0:scenecut=0:weightp=0:"
                   "aq-mode=0:trellis=0:psy=0:8x8dct=0:threads=1",
-                  ctx->qp, ctx->merange, ctx->subpel_enabled ? 7 : 1);
+                  ctx->qp, ctx->me, ctx->merange, ctx->subpel_enabled ? 7 : 1);
         av_opt_set(enc_ctx->priv_data, "preset", "ultrafast", 0);
         av_opt_set(enc_ctx->priv_data, "tune", "zerolatency", 0);
         av_opt_set(enc_ctx->priv_data, "x264-params", params, 0);
@@ -220,8 +231,33 @@ static int lavc_sw_extract(void *vctx, const cs_frame *left, const cs_frame *rig
     dec_ctx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
     if (avcodec_open2(dec_ctx, dec_codec, NULL) < 0) goto done;
 
+    /*
+     * x264 has no way for us to bias where its own motion search centers --
+     * it always searches around the neighbor-derived MV predictor (zero for
+     * the first MB), with radius merange. To reach a disparity range that
+     * doesn't straddle zero, physically pre-shift the right image by
+     * disparity_offset before encoding (so the *residual* motion x264 needs
+     * to find is small / near its own predictor), then let the existing
+     * dx + disparity_offset formula in cs_mv_field_to_disparity add the
+     * shift back. Mirrors what ref_sad does directly in its own indexed
+     * search (rx = x0 + disparity_offset + cdx) -- same disparity_offset
+     * contract, different mechanism, since a codec has no equivalent knob.
+     */
+    const cs_frame *right_for_encode = right;
+    cs_frame right_shifted;
+    if (ctx->disparity_offset != 0) {
+        right_shifted_buf = (uint8_t *)malloc((size_t)w * h);
+        if (!right_shifted_buf) goto done;
+        cs_shift_gray8(right->data[0], right->stride[0], right_shifted_buf, w,
+                        w, h, -ctx->disparity_offset);
+        right_shifted = *right;
+        right_shifted.data[0] = right_shifted_buf;
+        right_shifted.stride[0] = w;
+        right_for_encode = &right_shifted;
+    }
+
     fl = make_yuv420p_frame(left, 0, AV_PICTURE_TYPE_I);
-    fr = make_yuv420p_frame(right, 1, AV_PICTURE_TYPE_P);
+    fr = make_yuv420p_frame(right_for_encode, 1, AV_PICTURE_TYPE_P);
     if (!fl || !fr) goto done;
 
     pkt = av_packet_alloc();
@@ -318,6 +354,7 @@ done:
     if (fr) av_frame_free(&fr);
     if (enc_ctx) avcodec_free_context(&enc_ctx);
     if (dec_ctx) avcodec_free_context(&dec_ctx);
+    free(right_shifted_buf);
     return ret;
 }
 
