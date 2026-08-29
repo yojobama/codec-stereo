@@ -199,7 +199,8 @@ values off by >100px), fixed by adding the same pre-shift there too.
 |---|---|---|
 | `cs_backend_ref_sad` | `CS_MODE_DIRECT` | Working, calibrated. Brute-force SAD control/diagnostic backend — not a production path, exists to separate block-granularity error from encoder RD/predictor bias in validation. |
 | `cs_backend_lavc_sw` | `CS_MODE_ENCODE_DECODE` | Working, calibrated, validated on Middlebury. libx264 (`partitions=none`, `me` configurable, default `qp=10` — see Sec. 7's QP sweep finding) + software H.264 decode with `AV_CODEC_FLAG2_EXPORT_MVS`. Universal fallback; works on any platform libavcodec/libx264 are available. |
-| `cs_backend_rkmpp` | `CS_MODE_ENCODE_READBACK` | Working but **not yet correctness-validated** — real hardware data flows through `KEY_MOTION_INFO`, but with three undocumented behaviors discovered by testing (Sec. 12): only the top ~half of a frame's rows get written, real motion data only appears on even 16px-wide columns (native granularity looks like 32×16, not 16×16), and MV units are assumed-but-unconfirmed quarter-pel. Ships as an honestly-scoped starting point, not a finished backend. |
+| `cs_backend_rkmpp` | `CS_MODE_ENCODE_READBACK` | Working but **not yet correctness-validated** — real hardware data flows through `KEY_MOTION_INFO`, but with confirmed defects (Sec. 12): only the top ~half of a frame's rows get written, and real motion data only appears on even 16px-wide columns (odd columns' MV is stuck at a fixed placeholder while SAD is genuine — a real silicon/firmware defect, cross-confirmed by an independent bug report). Ships as an honestly-scoped starting point, not a finished backend. |
+| `cs_backend_rkmpp_hwenc` | `CS_MODE_ENCODE_DECODE` | **Working, calibrated.** Real VEPU580 hardware encode, but decodes the resulting bitstream with FFmpeg's *software* H.264 decoder + `AV_CODEC_FLAG2_EXPORT_MVS` (the same mechanism `lavc_sw` already validated) instead of reading `KEY_MOTION_INFO` — entirely sidesteps `cs_backend_rkmpp`'s defects. Passes `tests/test_calibration`. Not a speed win, though: at matched QP the software decode pass dominates end-to-end time regardless of who encoded the bitstream, so it performs about the same as pure-software `lavc_sw` (Sec. 12/9) on this SoC. Its value is correctness, not latency. |
 | `cs_backend_d3d12_vme` | `CS_MODE_ME_ONLY` | **Code-complete but never compiled or run** — this machine had no C++ toolchain, and installing one needs an admin UAC elevation this session couldn't obtain non-interactively. Windows-only by construction (see Sec. 5.1's Vulkan finding). |
 | `cs_backend_nvenc` | — | Not implemented; no NVIDIA hardware available to test against. |
 | `cs_backend_vaapi_fei` | — | Not implemented; no Intel hardware available, and FEI is dropped from the modern Intel media driver regardless. |
@@ -347,6 +348,41 @@ Neither block backend is close to SGBM; this matches Sec. 2's Non-Goal
 ("replacing dense stereo matchers where accuracy matters more than latency")
 rather than contradicting the design.
 
+**Latency** (`cs_bench`, median of N `cs_extract()` calls, 1920×1080 unless
+noted; every backend here creates a fresh encoder/decoder context per call --
+Sec. 6):
+
+| Backend | Machine | QP | Median |
+|---|---|---|---|
+| `ref_sad` (±16×4 search, 640×480) | Ryzen 5600X | n/a | 468 ms |
+| `ref_sad` (±16×4 search, 640×480) | Orange Pi (A76+A55) | n/a | 967 ms |
+| `lavc_sw` | Ryzen 5600X | 10 (default) | 65 ms |
+| `lavc_sw` | Orange Pi | 10 (default) | 138 ms |
+| `lavc_sw` | Orange Pi | 45 | 100 ms |
+| `rkmpp` (buggy readback path) | Orange Pi | 32 | 36 ms |
+| `rkmpp_hwenc` | Orange Pi | 45 | 98 ms |
+| `rkmpp_hwenc` | Orange Pi | 12 (default) | 386 ms |
+
+Two things worth taking away from this table, since neither matches what
+Sec. 3's non-functional requirements originally hoped for:
+
+1. **`rkmpp`'s 36-49ms (Sec. 12) is nowhere near "single-digit milliseconds."**
+   The most likely reason: every backend here re-creates its encoder context
+   from scratch on every call (a deliberate correctness-over-speed choice,
+   Sec. 6) rather than reusing one long-lived context — that setup/teardown
+   plausibly dominates the number, not the ASIC's actual search time. Nobody
+   has measured the two apart.
+2. **`rkmpp_hwenc` bought correctness, not speed.** At matched QP (45), it
+   comes in at 98ms against `lavc_sw`'s 100ms on the *same* Pi — essentially
+   identical. The software H.264 decode pass (the part it shares with
+   `lavc_sw`) dominates end-to-end time regardless of whether real VEPU580
+   silicon or libx264 produced the bitstream; the encoder's speed advantage
+   gets swamped by paying for a full decode afterward. QP matters more than
+   which encoder did the work: `rkmpp_hwenc` at its default QP=12 (chosen for
+   accuracy, mirroring `lavc_sw`'s own QP=10 rationale, Sec. 7) is nearly 4x
+   slower than at QP=45, because a much bigger, more detailed bitstream is
+   proportionally more expensive to *decode*, not just to produce.
+
 ## 10. Resolved / Open Questions
 
 Resolved by implementation:
@@ -396,8 +432,15 @@ Still open:
 A concise index into where the detail lives, for anyone picking this project
 back up:
 
-- **Working and calibrated**: `ref_sad`, `lavc_sw`. Both pass
-  `tests/test_calibration` and have real Middlebury numbers (Sec. 9).
+- **Working and calibrated**: `ref_sad`, `lavc_sw`, `rkmpp_hwenc`. All three
+  pass `tests/test_calibration`; `ref_sad`/`lavc_sw` also have real
+  Middlebury numbers (Sec. 9). `rkmpp_hwenc` encodes with real VEPU580
+  hardware but decodes with FFmpeg's software H.264 decoder + MV export
+  (the same mechanism `lavc_sw` validates) instead of `KEY_MOTION_INFO` --
+  it exists specifically because it sidesteps `rkmpp`'s defects below. Its
+  latency is a wash against `lavc_sw` (Sec. 9's latency table): the shared
+  software decode pass dominates regardless of who encoded the bitstream, so
+  its value is a correct fallback, not a speed win, on this SoC.
 - **Working, not yet correctness-validated**: `rkmpp`. Real hardware data
   flows through `KEY_MOTION_INFO` (confirmed via
   `src/backends/spike_mpp_mdinfo.c`), but with two confirmed defects and one
