@@ -370,12 +370,13 @@ Sec. 6):
 | `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | **CAVLC, persistent context (current)** | **56 ms steady-state** (88 ms first call) |
 | `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | **CAVLC, + stand-in IDR (current)** | **15.5 ms steady-state** |
 
-**Latency, final:** 386 ms -> 15.5 ms at 1080p, a **25x** speedup, from four
+**Latency, final:** 386 ms -> 15.0 ms at 1080p, a **26x** speedup, from five
 changes in order: CAVLC instead of CABAC; a persistent MPP + decoder context
 instead of rebuilding both per call; a stand-in IDR so the real (multi-MB)
-I-frame is encoded but never decoded; and a one-time flat-chroma fill.
+I-frame is encoded but never decoded; a one-time flat-chroma fill; and
+skipping IDCT/deblocking on decode.
 Resolution scaling of the final version is close to linear in pixels
-(640x480 3.2 ms, 1920x1080 15.5 ms, 3840x2160 58.2 ms), with a fixed ~1 ms
+(640x480 3.0 ms, 1920x1080 15.0 ms, 3840x2160 56.6 ms), with a fixed ~1 ms
 floor.
 
 Where the remaining 15.5 ms goes at 1080p: ~10.8 ms hardware encode (of
@@ -395,6 +396,40 @@ tried against it and measured as **not** worth taking:
   ASIC work, not bitstream-size-bound. This *reverses* the earlier finding
   in this same section, which was measured back when the I-frame's
   bitstream had to be entropy-decoded and its size therefore dominated.
+- **Slice-split encode + slice-threaded decode** (`MPP_ENC_SPLIT_BY_CTU` +
+  `FF_THREAD_SLICE`, `slices=N` in `backend_params`): implemented, and
+  measured *worse* -- the decode phase went 4.52 -> 4.76 ms at 4 slices and
+  6-worker throughput was flat (154.9 -> 152.9 pairs/s). libavcodec's
+  slice-thread synchronization costs more than it recovers on a ~4.5 ms
+  decode, most of which is fixed per-frame work rather than parallelizable
+  slice work. Kept default-off so it isn't re-tried blind; it may pay at
+  4K/8K where the parallel share is larger. Not accuracy-neutral either --
+  slice boundaries reset H.264's MV predictor.
+- **Overlapping the two encode submissions** (submit I and P before
+  collecting either, rather than put/get/put/get): measured neutral, 10.83
+  vs 10.74 ms. MPP evidently already pipelines internally, so there was no
+  CPU->ASIC->CPU round-trip stall sitting between the two frames to remove.
+  The `encode_submit()`/`encode_collect()` split was kept anyway -- it's no
+  slower, it's cleaner, and it's the shape any future cross-call encode
+  pipelining would need.
+
+**Taken:** skipping IDCT and the deblocking filter on decode
+(`skip_idct`/`skip_loop_filter` = `AVDISCARD_ALL`, now the default since
+nothing here ever reads a decoded pixel) -- worth ~3%, 15.42 -> 14.98 ms.
+Modest because entropy decode, which *cannot* be skipped (it must parse
+every coefficient just to know how many bits to consume), is the larger
+share of what remains. `CS_RKMPP_HWENC_FULL_RECON` restores it for
+debugging.
+
+**Is the benchmark pessimistic?** `cs_bench` feeds per-pixel white noise,
+which is maximally incompressible. A smooth, photo-like 1080p pair encodes
+to a 6.5x smaller I-frame (374 KB vs 2.4 MB) but only 8% faster (10.0 vs
+10.9 ms) -- confirming from the other direction that encode cost is fixed
+per-pixel ASIC work, and that the synthetic benchmark is very close to
+real-content behaviour rather than a worst case to be discounted. That same
+smooth 1080p pair also serves as the largest end-to-end accuracy check the
+project has: 8157 of 8160 blocks valid, mean disparity exactly 16.00
+against a known 16 px shift, through the fully optimized path.
 
 ## 9a. Throughput (cs_pipeline)
 

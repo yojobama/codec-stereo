@@ -104,6 +104,19 @@ typedef struct rkmpp_hwenc_ctx {
                   the NV12 chroma plane was always a constant 128 -- 1/3 of
                   every byte DMA'd to the ASIC, plus whatever the encoder
                   spends coding it, for no information at all. */
+    int slices; /* >1 = split each frame into this many slices
+                   (MPP_ENC_SPLIT_BY_CTU) so libavcodec's H.264 slice
+                   threading can decode them in parallel.
+                   MEASURED: NO BENEFIT, default off. At 1080p the decode
+                   phase got slightly *worse* (4.52 -> 4.76 ms at 4 slices)
+                   and 6-worker throughput was flat (154.9 -> 152.9
+                   pairs/s) -- libavcodec's slice-thread sync costs more
+                   than it saves on a ~4.5 ms decode, much of which is
+                   fixed per-frame work rather than parallelizable slice
+                   work. Kept, off, so this doesn't get re-tried blind;
+                   might pay at 4K/8K where the parallel share is larger.
+                   Note slice boundaries also reset H.264's MV predictor,
+                   so this is not accuracy-neutral either. */
     int cabac; /* 1=CABAC (default, denser/slower to decode), 0=CAVLC
                   (larger bitstream, no sequential-arithmetic-coding
                   dependency chain -- worth testing since I-frame CABAC
@@ -213,6 +226,8 @@ static int rkmpp_hwenc_init(void *vctx, const cs_config *cfg) {
         if (c) ctx->cabac = atoi(c + 6);
         const char *m = strstr(cfg->backend_params, "mono=");
         if (m) ctx->mono = atoi(m + 5);
+        const char *sl = strstr(cfg->backend_params, "slices=");
+        if (sl) ctx->slices = atoi(sl + 7);
         const char *p = strstr(cfg->backend_params, "qp=");
         if (p) { ctx->qp = atoi(p + 3); ctx->qp_i = ctx->qp; }
         const char *pi = strstr(cfg->backend_params, "qp_i=");
@@ -280,10 +295,13 @@ static int fill_nv12_luma(MppBuffer buf, const uint8_t *luma, int stride,
  * it can be handed straight to av_packet_from_data with no second copy.
  * Caller owns *out_bs.
  */
-static int encode_one_frame(rkmpp_hwenc_ctx *ctx, int w, int h,
-                             int hor_stride, int ver_stride,
-                             MppBuffer frm_buf, MppBuffer pkt_buf,
-                             uint8_t **out_bs, size_t *out_len) {
+/* Hands one frame to the encoder without waiting for its packet. MPP's
+   encode_put_frame is documented as an async interface, so two frames can
+   be in flight at once -- see encode_collect() and the async path in
+   extract(). */
+static int encode_submit(rkmpp_hwenc_ctx *ctx, int w, int h,
+                          int hor_stride, int ver_stride,
+                          MppBuffer frm_buf, MppBuffer pkt_buf) {
     MppFrame frame = NULL;
     MppPacket packet = NULL;
 
@@ -304,8 +322,14 @@ static int encode_one_frame(rkmpp_hwenc_ctx *ctx, int w, int h,
 
     MPP_RET pr = ctx->mpi->encode_put_frame(ctx->mctx, frame);
     mpp_frame_deinit(&frame);
-    if (pr != MPP_OK) return -1;
+    return (pr == MPP_OK) ? 0 : -1;
+}
 
+/* Collects the next encoded packet, in submission order, copying it into a
+   freshly av_malloc'd buffer padded by AV_INPUT_BUFFER_PADDING_SIZE so it
+   can go straight to av_packet_from_data with no second copy. Caller owns
+   *out_bs. */
+static int encode_collect(rkmpp_hwenc_ctx *ctx, uint8_t **out_bs, size_t *out_len) {
     MppPacket out_packet = NULL;
     if (ctx->mpi->encode_get_packet(ctx->mctx, &out_packet) != MPP_OK || !out_packet)
         return -1;
@@ -321,6 +345,15 @@ static int encode_one_frame(rkmpp_hwenc_ctx *ctx, int w, int h,
     *out_bs = copy;
     *out_len = len;
     return 0;
+}
+
+static int encode_one_frame(rkmpp_hwenc_ctx *ctx, int w, int h,
+                             int hor_stride, int ver_stride,
+                             MppBuffer frm_buf, MppBuffer pkt_buf,
+                             uint8_t **out_bs, size_t *out_len) {
+    if (encode_submit(ctx, w, h, hor_stride, ver_stride, frm_buf, pkt_buf) != 0)
+        return -1;
+    return encode_collect(ctx, out_bs, out_len);
 }
 
 static void teardown_mpp_context(rkmpp_hwenc_ctx *ctx) {
@@ -398,6 +431,17 @@ static int ensure_mpp_context(rkmpp_hwenc_ctx *ctx, int w, int h) {
     mpp_enc_cfg_set_s32(cfg, "h264:level", 40);
     mpp_enc_cfg_set_s32(cfg, "h264:cabac_en", ctx->cabac);
 
+    if (ctx->slices > 1) {
+        /* Split by macroblock count so the frame lands in ctx->slices
+           roughly-equal slices; the decoder can then work on them
+           concurrently. */
+        int mb_rows = (h + 15) / 16;
+        int mb_cols = (w + 15) / 16;
+        int mbs_per_slice = (mb_rows * mb_cols + ctx->slices - 1) / ctx->slices;
+        mpp_enc_cfg_set_s32(cfg, "split:mode", MPP_ENC_SPLIT_BY_CTU);
+        mpp_enc_cfg_set_s32(cfg, "split:arg", mbs_per_slice);
+    }
+
     if (ctx->mpi->control(ctx->mctx, MPP_ENC_SET_CFG, cfg) != MPP_OK) goto done;
 
     {
@@ -411,7 +455,24 @@ static int ensure_mpp_context(rkmpp_hwenc_ctx *ctx, int w, int h) {
         ctx->dec_ctx = avcodec_alloc_context3(dec_codec);
         if (!ctx->dec_ctx) goto done;
         ctx->dec_ctx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
-        if (getenv("CS_RKMPP_HWENC_SKIP_RECON")) {
+        if (ctx->slices > 1) {
+            /* Slice threading only: frame threading is useless here (our
+               two frames are dependent -- the P references the stand-in
+               IDR) and would add output latency. */
+            ctx->dec_ctx->thread_type = FF_THREAD_SLICE;
+            ctx->dec_ctx->thread_count = ctx->slices;
+        }
+        /*
+         * Nothing here ever looks at a decoded pixel -- only at parsed
+         * motion vectors -- so skip the two decode stages that exist
+         * purely to produce pixels. Worth ~3% (15.42 -> 14.98 ms at
+         * 1080p); modest because entropy decode, which cannot be skipped
+         * (it has to parse every coefficient just to know how many bits
+         * to consume), is the larger share. Set CS_RKMPP_HWENC_FULL_RECON
+         * to restore full reconstruction if you ever need to eyeball the
+         * decoded frames while debugging.
+         */
+        if (!getenv("CS_RKMPP_HWENC_FULL_RECON")) {
             ctx->dec_ctx->skip_idct = AVDISCARD_ALL;
             ctx->dec_ctx->skip_loop_filter = AVDISCARD_ALL;
         }
@@ -510,24 +571,32 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
 
     double t_setup_done = timing ? now_ms() : 0;
 
-    MppBuffer frm_bufs[2] = {ctx->frm_buf_l, ctx->frm_buf_r};
-    MppBuffer pkt_bufs[2] = {ctx->pkt_buf_l, ctx->pkt_buf_r};
-    for (int i = 0; i < 2; i++) {
-        double t_frame_start = timing ? now_ms() : 0;
-        uint8_t *bs = NULL;
-        size_t len = 0;
+    /*
+     * Submit BOTH frames before collecting either. The P-frame genuinely
+     * depends on the I-frame's reconstruction, so the ASIC still encodes
+     * them in order -- but queueing the second submission up front removes
+     * a CPU->ASIC->CPU round-trip from between them (the old code did
+     * put/get/put/get, so the encoder sat idle across a full wakeup while
+     * the CPU noticed frame 0 was done and went to submit frame 1).
+     * Each frame carries its own KEY_OUTPUT_PACKET buffer, so having two
+     * in flight doesn't alias. Packets come back in submission order.
+     */
+    double t_submit_start = timing ? now_ms() : 0;
+    if (encode_submit(ctx, w, h, hor_stride, ver_stride,
+                       ctx->frm_buf_l, ctx->pkt_buf_l) != 0) goto done;
+    if (encode_submit(ctx, w, h, hor_stride, ver_stride,
+                       ctx->frm_buf_r, ctx->pkt_buf_r) != 0) goto done;
+    if (timing)
+        fprintf(stderr, "TIMING hw_submit_both %.3f ms\n", now_ms() - t_submit_start);
 
-        if (encode_one_frame(ctx, w, h, hor_stride, ver_stride,
-                              frm_bufs[i], pkt_bufs[i], &bs, &len) != 0)
-            goto done;
-
-        if (i == 0) { bitstream_i = bs; bitstream_i_len = len; }
-        else        { bitstream_p = bs; bitstream_p_len = len; }
-
-        if (timing)
-            fprintf(stderr, "TIMING hw_encode[%d] %.3f ms (%zu bytes)\n",
-                    i, now_ms() - t_frame_start, len);
-    }
+    if (encode_collect(ctx, &bitstream_i, &bitstream_i_len) != 0) goto done;
+    if (timing)
+        fprintf(stderr, "TIMING hw_encode[0] %.3f ms (%zu bytes)\n",
+                now_ms() - t_submit_start, bitstream_i_len);
+    if (encode_collect(ctx, &bitstream_p, &bitstream_p_len) != 0) goto done;
+    if (timing)
+        fprintf(stderr, "TIMING hw_encode[1] %.3f ms (%zu bytes cumulative)\n",
+                now_ms() - t_submit_start, bitstream_p_len);
 
     /*
      * The real I-frame has now done its only job -- being the reference the
