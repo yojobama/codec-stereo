@@ -33,12 +33,30 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
+
+/* Set CS_LAVC_SW_TIMING to any value for a phase breakdown to stderr:
+   encode setup, HW... er, SW encode (per frame), decoder setup, SW decode
+   (per packet) -- same diagnostic pattern as cs_backend_rkmpp_hwenc.c,
+   added to check whether that backend's CAVLC-decodes-faster-than-CABAC
+   finding transfers here (it didn't -- see below for why). */
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 typedef struct lavc_sw_ctx {
     int block_w, block_h;
     int merange;          /* x264 has one scalar search range, not separate x/y */
     int subpel_enabled;
     int qp;
+    int cabac;             /* 1=CABAC (default), 0=CAVLC -- see
+                               cs_backend_rkmpp_hwenc.c's finding that CAVLC
+                               decodes markedly faster on ARM despite a
+                               larger bitstream (no sequential-arithmetic-
+                               coding dependency chain); worth the same
+                               tradeoff here since decode cost is shared. */
     char me[8];            /* x264 "me" method: esa (exhaustive, default) or a
                                faster heuristic (umh/hex/dia) for large merange,
                                where esa's O(merange^2) cost becomes intractable */
@@ -64,6 +82,7 @@ static void apply_backend_params(lavc_sw_ctx *ctx, const char *params) {
         *eq = '\0';
         const char *key = tok, *val = eq + 1;
         if (strcmp(key, "qp") == 0) ctx->qp = atoi(val);
+        else if (strcmp(key, "cabac") == 0) ctx->cabac = atoi(val);
         else if (strcmp(key, "me") == 0) {
             strncpy(ctx->me, val, sizeof ctx->me - 1);
             ctx->me[sizeof ctx->me - 1] = '\0';
@@ -121,6 +140,18 @@ static int lavc_sw_init(void *vctx, const cs_config *cfg) {
      * justifies moving it.
      */
     ctx->qp = 10;
+    /*
+     * Default flipped to CAVLC after measuring it: CS_LAVC_SW_TIMING showed
+     * a clean CABAC-vs-CAVLC A/B (same session, same QP=45) at 162ms vs
+     * 100ms -- ~38% faster -- with the saving entirely in x264's own
+     * encoder-side mode-decision/rate-estimation cost (encode_and_feed:
+     * 155ms->89ms), not decode (decode_drain stayed ~4.5ms either way).
+     * No accuracy difference observed on tests/test_calibration or a
+     * synthetic known-shift pair. Not yet re-validated against Middlebury
+     * (Docs Sec. 9's table predates this change) -- override to cabac=1
+     * via backend_params if that turns out to matter on real content.
+     */
+    ctx->cabac = 0;
     strncpy(ctx->me, "esa", sizeof ctx->me - 1); /* exhaustive; O(merange^2),
         override to umh/hex/dia via backend_params for large merange */
 
@@ -211,6 +242,9 @@ static int lavc_sw_extract(void *vctx, const cs_frame *left, const cs_frame *rig
     AVPacket *pkt = NULL;
     uint8_t *right_shifted_buf = NULL;
 
+    int timing = getenv("CS_LAVC_SW_TIMING") != NULL;
+    double t0 = timing ? now_ms() : 0;
+
     const AVCodec *enc_codec = avcodec_find_encoder_by_name("libx264");
     const AVCodec *dec_codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     if (!enc_codec || !dec_codec) goto done;
@@ -227,10 +261,10 @@ static int lavc_sw_extract(void *vctx, const cs_frame *left, const cs_frame *rig
     {
         char params[256];
         snprintf(params, sizeof params,
-                  "qp=%d:me=%s:merange=%d:subme=%d:partitions=none:ref=1:"
+                  "qp=%d:cabac=%d:me=%s:merange=%d:subme=%d:partitions=none:ref=1:"
                   "bframes=0:rc-lookahead=0:mbtree=0:scenecut=0:weightp=0:"
                   "aq-mode=0:trellis=0:psy=0:8x8dct=0:threads=1",
-                  ctx->qp, ctx->me, ctx->merange, ctx->subpel_enabled ? 7 : 1);
+                  ctx->qp, ctx->cabac, ctx->me, ctx->merange, ctx->subpel_enabled ? 7 : 1);
         av_opt_set(enc_ctx->priv_data, "preset", "ultrafast", 0);
         av_opt_set(enc_ctx->priv_data, "tune", "zerolatency", 0);
         av_opt_set(enc_ctx->priv_data, "x264-params", params, 0);
@@ -242,6 +276,8 @@ static int lavc_sw_extract(void *vctx, const cs_frame *left, const cs_frame *rig
     if (!dec_ctx) goto done;
     dec_ctx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
     if (avcodec_open2(dec_ctx, dec_codec, NULL) < 0) goto done;
+
+    double t_setup_done = timing ? now_ms() : 0;
 
     /*
      * x264 has no way for us to bias where its own motion search centers --
@@ -302,6 +338,8 @@ static int lavc_sw_extract(void *vctx, const cs_frame *left, const cs_frame *rig
     }
     avcodec_send_packet(dec_ctx, NULL); /* flush decoder */
 
+    double t_fed_done = timing ? now_ms() : 0;
+
     /* Drain decoded frames, keep the one with pts == 1 (the P-frame / right
        image); the I-frame (pts == 0) carries no inter motion by definition. */
     for (;;) {
@@ -346,6 +384,14 @@ static int lavc_sw_extract(void *vctx, const cs_frame *left, const cs_frame *rig
             }
         }
         av_frame_unref(dec_frame);
+    }
+
+    if (timing) {
+        double t_drain_done = now_ms();
+        fprintf(stderr,
+                "TIMING setup=%.3f encode_and_feed=%.3f decode_drain=%.3f overall=%.3f (ms)\n",
+                t_setup_done - t0, t_fed_done - t_setup_done,
+                t_drain_done - t_fed_done, t_drain_done - t0);
     }
 
     out->dx = ctx->dx;

@@ -98,6 +98,10 @@ typedef struct rkmpp_hwenc_ctx {
                   just "qp=") since it's harmless and documents a real,
                   verified dead end rather than silently re-discovering it. */
     int32_t disparity_offset;
+    int cabac; /* 1=CABAC (default, denser/slower to decode), 0=CAVLC
+                  (larger bitstream, no sequential-arithmetic-coding
+                  dependency chain -- worth testing since I-frame CABAC
+                  entropy decode is this backend's dominant cost) */
 
     int cols, rows;
     int16_t *dx, *dy;
@@ -133,8 +137,23 @@ static int rkmpp_hwenc_init(void *vctx, const cs_config *cfg) {
     ctx->qp = 12;
     ctx->qp_i = 12; /* default: uniform QP, matching lavc_sw/rkmpp's own default */
     ctx->disparity_offset = cfg->disparity_offset;
+    /*
+     * Default flipped to CAVLC after measuring it: at qp=12 (this backend's
+     * own accuracy-first default, unchanged), CABAC->CAVLC took extract()
+     * from ~386ms to ~94ms -- a 4.1x speedup, bigger than at qp=45 (~99ms
+     * -> ~69ms), consistent with CAVLC helping more the more coefficients
+     * there are to entropy-decode. No accuracy difference observed on
+     * tests/test_calibration or a synthetic known-shift pair (every block
+     * came back exactly 16.0, cleaner than the qp=45 comparison's couple of
+     * edge blocks). Not yet re-validated against Middlebury-scale real
+     * content -- override to cabac=1 via backend_params if that turns out
+     * to matter.
+     */
+    ctx->cabac = 0;
 
     if (cfg->backend_params) {
+        const char *c = strstr(cfg->backend_params, "cabac=");
+        if (c) ctx->cabac = atoi(c + 6);
         const char *p = strstr(cfg->backend_params, "qp=");
         if (p) { ctx->qp = atoi(p + 3); ctx->qp_i = ctx->qp; }
         const char *pi = strstr(cfg->backend_params, "qp_i=");
@@ -278,7 +297,7 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
     mpp_enc_cfg_set_s32(cfg, "codec:type", MPP_VIDEO_CodingAVC);
     mpp_enc_cfg_set_s32(cfg, "h264:profile", 100);
     mpp_enc_cfg_set_s32(cfg, "h264:level", 40);
-    mpp_enc_cfg_set_s32(cfg, "h264:cabac_en", 1);
+    mpp_enc_cfg_set_s32(cfg, "h264:cabac_en", ctx->cabac);
 
     if (mpi->control(mctx, MPP_ENC_SET_CFG, cfg) != MPP_OK) goto done;
 

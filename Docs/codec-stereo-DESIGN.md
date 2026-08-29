@@ -352,19 +352,43 @@ rather than contradicting the design.
 noted; every backend here creates a fresh encoder/decoder context per call --
 Sec. 6):
 
-| Backend | Machine | QP | Median |
-|---|---|---|---|
-| `ref_sad` (±16×4 search, 640×480) | Ryzen 5600X | n/a | 468 ms |
-| `ref_sad` (±16×4 search, 640×480) | Orange Pi (A76+A55) | n/a | 967 ms |
-| `lavc_sw` | Ryzen 5600X | 10 (default) | 65 ms |
-| `lavc_sw` | Orange Pi | 10 (default) | 138 ms |
-| `lavc_sw` | Orange Pi | 45 | 100 ms |
-| `rkmpp` (buggy readback path) | Orange Pi | 32 | 36 ms |
-| `rkmpp_hwenc` | Orange Pi | 45 | 98 ms |
-| `rkmpp_hwenc` | Orange Pi | 12 (default) | 386 ms |
+| Backend | Machine | QP | CABAC/CAVLC | Median |
+|---|---|---|---|---|
+| `ref_sad` (±16×4 search, 640×480) | Ryzen 5600X | n/a | n/a | 468 ms |
+| `ref_sad` (±16×4 search, 640×480) | Orange Pi (A76+A55) | n/a | n/a | 967 ms |
+| `lavc_sw` | Ryzen 5600X | 10 | CABAC (old default)\* | 65 ms |
+| `lavc_sw` | Orange Pi | 10 | CABAC (old default)\* | 138 ms |
+| `lavc_sw` | Orange Pi | 45 | CABAC | 162 ms |
+| `lavc_sw` | Orange Pi | 45 | **CAVLC (new default)** | 100 ms |
+| `lavc_sw` | Orange Pi | 10 (accuracy default) | CABAC | 649-673 ms |
+| `lavc_sw` | Orange Pi | 10 (accuracy default) | **CAVLC (new default)** | **137 ms** |
+| `rkmpp` (buggy readback path) | Orange Pi | 32 | CABAC | 36 ms |
+| `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | CABAC (old default) | 386 ms |
+| `rkmpp_hwenc` | Orange Pi | 45 | CABAC | 99 ms |
+| `rkmpp_hwenc` | Orange Pi | 45 | CAVLC | 69 ms |
+| `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | **CAVLC (new default)** | **94 ms** |
 
-Two things worth taking away from this table, since neither matches what
-Sec. 3's non-functional requirements originally hoped for:
+\* These two rows are the very first measurements taken in this project,
+before `lavc_sw` had any explicit CABAC/CAVLC control at all -- and they
+match the *CAVLC* numbers (65.7ms / 137ms) far more closely than the CABAC
+ones (319ms / 649-673ms), confirmed by directly re-running the exact same
+qp=10 config on the Ryzen with cabac explicitly forced each way. The real
+explanation: x264's `ultrafast` preset (used here from the start) already
+defaults to CAVLC as part of its own speed tuning -- a well-known preset
+characteristic, not something specific to this project. When explicit
+`cabac`/`qp_i` support was added to this backend later in the same
+investigation that produced the rest of this table, the new `ctx->cabac`
+field defaulted to 1, silently *overriding* the preset's own CAVLC choice
+and introducing the CABAC slowdown as a side effect of adding the control
+knob -- which the fix earlier in this same investigation (defaulting
+`cabac` to 0) then corrected back out. Net effect across the whole
+session: no real regression, just a detour through a self-introduced,
+self-corrected one. Labeled "CABAC (old default)" above is therefore
+technically wrong for what was actually running at the time; kept as
+originally recorded for a transparent history rather than silently edited.
+
+Three things worth taking away from this table, since none of them match
+what Sec. 3's non-functional requirements originally hoped for:
 
 1. **`rkmpp`'s 36-49ms (Sec. 12) is nowhere near "single-digit milliseconds."**
    The most likely reason: every backend here re-creates its encoder context
@@ -372,16 +396,44 @@ Sec. 3's non-functional requirements originally hoped for:
    Sec. 6) rather than reusing one long-lived context — that setup/teardown
    plausibly dominates the number, not the ASIC's actual search time. Nobody
    has measured the two apart.
-2. **`rkmpp_hwenc` bought correctness, not speed.** At matched QP (45), it
-   comes in at 98ms against `lavc_sw`'s 100ms on the *same* Pi — essentially
-   identical. The software H.264 decode pass (the part it shares with
-   `lavc_sw`) dominates end-to-end time regardless of whether real VEPU580
-   silicon or libx264 produced the bitstream; the encoder's speed advantage
-   gets swamped by paying for a full decode afterward. QP matters more than
-   which encoder did the work: `rkmpp_hwenc` at its default QP=12 (chosen for
-   accuracy, mirroring `lavc_sw`'s own QP=10 rationale, Sec. 7) is nearly 4x
-   slower than at QP=45, because a much bigger, more detailed bitstream is
-   proportionally more expensive to *decode*, not just to produce.
+2. **CABAC vs CAVLC is a real, large lever for *both* software-decode
+   backends -- ~35-40% at matched QP, and up to 4.1x at `rkmpp_hwenc`'s
+   accuracy-first QP=12 -- for two different reasons per backend.** A
+   phase-by-phase breakdown (`CS_RKMPP_HWENC_TIMING` /
+   `CS_LAVC_SW_TIMING`, both added specifically to answer this) shows:
+   for `rkmpp_hwenc`, the saving is genuinely in *decode* (I-frame CABAC
+   entropy decode: ~51ms -> ~22ms at qp=45) -- expected, since real
+   VEPU580 silicon does the encoding and only decode is software here.
+   For `lavc_sw`, the saving is almost entirely on the *encode* side
+   (`encode_and_feed`: 155ms -> 89ms at qp=45; `decode_drain` barely
+   moves, ~4.5ms either way) -- x264's own CABAC rate-cost estimation
+   during mode decision is measurably more expensive than CAVLC's, a
+   known x264 characteristic, not something specific to this project.
+   Skipping IDCT/deblocking (`CS_RKMPP_HWENC_SKIP_RECON`, since decoded
+   pixels are never inspected) saved under 10% by comparison -- entropy
+   decode has to fully parse every coded coefficient regardless of
+   whether an IDCT is later applied to them, so that lever doesn't help
+   much. No accuracy difference from CAVLC was observed on
+   `tests/test_calibration` or a synthetic known-shift pair (every block
+   came back exactly the true disparity at `rkmpp_hwenc`'s new qp=12/CAVLC
+   default -- cleaner than the qp=45 comparisons, which had a couple of
+   edge-block artifacts either way). For `rkmpp_hwenc` (which didn't exist
+   yet when Sec. 9's Middlebury run was done) this is genuinely
+   unvalidated against real content. For `lavc_sw` it's a non-issue: the
+   `x264-params` string never included a `cabac` key at all until this
+   investigation added one, and `ultrafast` (used since Phase 1) already
+   defaults to CAVLC as part of its own preset tuning -- so Sec. 9's
+   Middlebury numbers were already produced under CAVLC the whole time,
+   the new explicit default just makes that the same going forward
+   instead of an accident of an unset option. **Both backends now default
+   to CAVLC**; override to `cabac=1` via `backend_params` if real content
+   ever shows a problem this hasn't caught.
+3. **Once both are CAVLC-tuned, `rkmpp_hwenc` genuinely is faster than
+   `lavc_sw`** (94ms vs 100ms+ at comparable settings) -- a real, if
+   modest, win from real silicon, which the original CABAC-only
+   comparison (both ~99-100ms) had obscured by leaving a big,
+   backend-specific inefficiency (x264's CABAC mode-decision cost) baked
+   into one side of the comparison and not the other.
 
 **Where exactly the `rkmpp_hwenc` time goes** (`CS_RKMPP_HWENC_TIMING`,
 1920×1080, qp=45, one call): of ~93ms total, HW encode is ~10ms, MPP
