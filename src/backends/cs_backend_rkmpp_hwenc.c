@@ -131,6 +131,30 @@ typedef struct rkmpp_hwenc_ctx {
     MppBuffer frm_buf_l, frm_buf_r, pkt_buf_l, pkt_buf_r;
     AVCodecContext *dec_ctx;
 
+    /*
+     * Stand-in IDR: a single throwaway flat-gray frame, encoded once at
+     * setup with this same encoder/SPS/PPS, and fed to the DECODER in
+     * place of the real I-frame on every call.
+     *
+     * Why this works: motion vectors are parsed syntax elements. A
+     * reference frame's pixels are needed only to reconstruct the
+     * P-frame's pixels, which this backend discards -- so the reference
+     * the decoder holds does not have to be the one the ENCODER actually
+     * searched against. The real left image is still encoded every call
+     * (the ASIC's motion search genuinely needs it), it just never gets
+     * decoded. A flat-gray IDR compresses to a couple of KB versus the
+     * real I-frame's ~2.4MB at qp=12, and the real I-frame's ~42ms decode
+     * was ~75% of this backend's entire runtime.
+     *
+     * Skipping the I-frame decode outright was tried first and does NOT
+     * work: with an entirely empty DPB, libavcodec logs "Missing
+     * reference picture, default is 0" and then fails in
+     * decode_slice_header -- it needs *a* reference present to substitute,
+     * it just doesn't care whether the pixels are meaningful.
+     */
+    uint8_t *stub_idr;
+    size_t stub_idr_len;
+
     int cols, rows;
     int16_t *dx, *dy;
     uint16_t *cost; /* always zero; this backend never reports cost */
@@ -243,7 +267,58 @@ static int fill_nv12_luma(MppBuffer buf, const uint8_t *luma, int stride,
     return 0;
 }
 
+/*
+ * Encodes whatever is currently in frm_buf, returning a freshly av_malloc'd
+ * copy of the resulting bitstream padded by AV_INPUT_BUFFER_PADDING_SIZE so
+ * it can be handed straight to av_packet_from_data with no second copy.
+ * Caller owns *out_bs.
+ */
+static int encode_one_frame(rkmpp_hwenc_ctx *ctx, int w, int h,
+                             int hor_stride, int ver_stride,
+                             MppBuffer frm_buf, MppBuffer pkt_buf,
+                             uint8_t **out_bs, size_t *out_len) {
+    MppFrame frame = NULL;
+    MppPacket packet = NULL;
+
+    if (mpp_frame_init(&frame) != MPP_OK || !frame) return -1;
+    mpp_frame_set_width(frame, w);
+    mpp_frame_set_height(frame, h);
+    mpp_frame_set_hor_stride(frame, hor_stride);
+    mpp_frame_set_ver_stride(frame, ver_stride);
+    mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
+    /* eos deliberately never set: that tells MPP the whole stream has
+       ended, which is wrong for a context meant to keep serving future
+       calls (see the struct comment above). */
+    mpp_frame_set_buffer(frame, frm_buf);
+
+    mpp_packet_init_with_buffer(&packet, pkt_buf);
+    mpp_packet_set_length(packet, 0);
+    mpp_meta_set_packet(mpp_frame_get_meta(frame), KEY_OUTPUT_PACKET, packet);
+
+    MPP_RET pr = ctx->mpi->encode_put_frame(ctx->mctx, frame);
+    mpp_frame_deinit(&frame);
+    if (pr != MPP_OK) return -1;
+
+    MppPacket out_packet = NULL;
+    if (ctx->mpi->encode_get_packet(ctx->mctx, &out_packet) != MPP_OK || !out_packet)
+        return -1;
+
+    void *pos = mpp_packet_get_pos(out_packet);
+    size_t len = mpp_packet_get_length(out_packet);
+    uint8_t *copy = (uint8_t *)av_malloc(len + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!copy) { mpp_packet_deinit(&out_packet); return -1; }
+    memcpy(copy, pos, len);
+    memset(copy + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    mpp_packet_deinit(&out_packet);
+
+    *out_bs = copy;
+    *out_len = len;
+    return 0;
+}
+
 static void teardown_mpp_context(rkmpp_hwenc_ctx *ctx) {
+    av_freep(&ctx->stub_idr);
+    ctx->stub_idr_len = 0;
     if (ctx->dec_ctx) avcodec_free_context(&ctx->dec_ctx);
     if (ctx->frm_buf_l) { mpp_buffer_put(ctx->frm_buf_l); ctx->frm_buf_l = NULL; }
     if (ctx->frm_buf_r) { mpp_buffer_put(ctx->frm_buf_r); ctx->frm_buf_r = NULL; }
@@ -334,6 +409,19 @@ static int ensure_mpp_context(rkmpp_hwenc_ctx *ctx, int w, int h) {
         if (avcodec_open2(ctx->dec_ctx, dec_codec, NULL) < 0) goto done;
     }
 
+    /*
+     * Build the stand-in IDR (see the struct comment): frm_buf_l is still
+     * the flat 128 from fill_flat128 above, so this encodes an entirely
+     * uniform frame -- a couple of KB. Forced to IDR so it carries inline
+     * SPS/PPS (MPP_ENC_HEADER_MODE_EACH_IDR) and lands at frame_num 0,
+     * exactly what the real per-call P-frame at frame_num 1 expects to
+     * reference.
+     */
+    if (ctx->mpi->control(ctx->mctx, MPP_ENC_SET_IDR_FRAME, NULL) != MPP_OK) goto done;
+    if (encode_one_frame(ctx, w, h, hor_stride, ver_stride,
+                          ctx->frm_buf_l, ctx->pkt_buf_l,
+                          &ctx->stub_idr, &ctx->stub_idr_len) != 0) goto done;
+
     ctx->cur_w = w;
     ctx->cur_h = h;
     ctx->mpp_ready = 1;
@@ -417,50 +505,29 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
     MppBuffer pkt_bufs[2] = {ctx->pkt_buf_l, ctx->pkt_buf_r};
     for (int i = 0; i < 2; i++) {
         double t_frame_start = timing ? now_ms() : 0;
-        MppFrame frame = NULL;
-        MppPacket packet = NULL;
+        uint8_t *bs = NULL;
+        size_t len = 0;
 
-        mpp_frame_init(&frame);
-        mpp_frame_set_width(frame, w);
-        mpp_frame_set_height(frame, h);
-        mpp_frame_set_hor_stride(frame, hor_stride);
-        mpp_frame_set_ver_stride(frame, ver_stride);
-        mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
-        /* eos deliberately never set: that tells MPP the whole stream has
-           ended, which is wrong for a context meant to keep serving future
-           calls (see the struct comment above). */
-        mpp_frame_set_buffer(frame, frm_bufs[i]);
+        if (encode_one_frame(ctx, w, h, hor_stride, ver_stride,
+                              frm_bufs[i], pkt_bufs[i], &bs, &len) != 0)
+            goto done;
 
-        mpp_packet_init_with_buffer(&packet, pkt_bufs[i]);
-        mpp_packet_set_length(packet, 0);
-        mpp_meta_set_packet(mpp_frame_get_meta(frame), KEY_OUTPUT_PACKET, packet);
-
-        MPP_RET pr = mpi->encode_put_frame(mctx, frame);
-        mpp_frame_deinit(&frame);
-        if (pr != MPP_OK) goto done;
-
-        MppPacket out_packet = NULL;
-        if (mpi->encode_get_packet(mctx, &out_packet) != MPP_OK || !out_packet) goto done;
-
-        void *pos = mpp_packet_get_pos(out_packet);
-        size_t len = mpp_packet_get_length(out_packet);
-        /* av_malloc (not plain malloc) with AV_INPUT_BUFFER_PADDING_SIZE
-           slack so this buffer can be handed directly to av_packet_from_data
-           below with no second copy into a separately-allocated AVPacket
-           buffer (av_new_packet + memcpy, as this used to do). */
-        uint8_t *copy = (uint8_t *)av_malloc(len + AV_INPUT_BUFFER_PADDING_SIZE);
-        if (!copy) { mpp_packet_deinit(&out_packet); goto done; }
-        memcpy(copy, pos, len);
-        memset(copy + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-        mpp_packet_deinit(&out_packet);
-
-        if (i == 0) { bitstream_i = copy; bitstream_i_len = len; }
-        else        { bitstream_p = copy; bitstream_p_len = len; }
+        if (i == 0) { bitstream_i = bs; bitstream_i_len = len; }
+        else        { bitstream_p = bs; bitstream_p_len = len; }
 
         if (timing)
             fprintf(stderr, "TIMING hw_encode[%d] %.3f ms (%zu bytes)\n",
                     i, now_ms() - t_frame_start, len);
     }
+
+    /*
+     * The real I-frame has now done its only job -- being the reference the
+     * ASIC's motion search ran against. It is never decoded (the stand-in
+     * IDR takes its place below), so drop it here rather than carrying a
+     * multi-MB buffer through the rest of the call.
+     */
+    av_freep(&bitstream_i);
+    bitstream_i_len = 0;
 
     double t_encode_done = timing ? now_ms() : 0;
 
@@ -481,11 +548,15 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
     pkt_p = av_packet_alloc();
     dec_frame = av_frame_alloc();
     if (!pkt_i || !pkt_p || !dec_frame) goto done;
-    /* Takes ownership of bitstream_i/bitstream_p (av_malloc'd with padding
-       above) -- no further copy, and `done:` must not free them itself
-       once this succeeds. */
-    if (av_packet_from_data(pkt_i, bitstream_i, (int)bitstream_i_len) < 0) goto done;
-    bitstream_i = NULL;
+
+    /* The stand-in IDR (persistent, owned by ctx) is copied per call rather
+       than handed over -- it's a couple of KB, so the copy is noise next to
+       the ~42ms of real-I-frame decode it replaces. */
+    if (av_new_packet(pkt_i, (int)ctx->stub_idr_len) < 0) goto done;
+    memcpy(pkt_i->data, ctx->stub_idr, ctx->stub_idr_len);
+
+    /* Takes ownership of bitstream_p (av_malloc'd with padding above) --
+       no further copy, and `done:` must not free it once this succeeds. */
     if (av_packet_from_data(pkt_p, bitstream_p, (int)bitstream_p_len) < 0) goto done;
     bitstream_p = NULL;
     pkt_i->pts = 0;
