@@ -400,20 +400,47 @@ back up:
   `tests/test_calibration` and have real Middlebury numbers (Sec. 9).
 - **Working, not yet correctness-validated**: `rkmpp`. Real hardware data
   flows through `KEY_MOTION_INFO` (confirmed via
-  `src/backends/spike_mpp_mdinfo.c`), but three behaviors were found that
-  appear nowhere in the public MPP repo or a web search at the time this was
-  written (the HAL source only wires a buffer fd to a hardware register; the
-  bit layout itself is ASIC-generated): motion data is only written for the
-  top ~half of a frame's MB-rows (confirmed at 3 heights: 96/192/384px all
-  split almost exactly in half); real motion data only appears at even
-  16-wide raw block columns (odd columns carry a fixed, content-independent
-  value while SAD still varies genuinely per-block — native MV granularity
-  looks like 32×16); and mvx/mvy units are assumed quarter-pel (empirically
-  consistent, not vendor-confirmed). `cs_backend_rkmpp.c`'s file header has
-  the full account. A real, incidental lesson from the same investigation:
-  pure per-pixel noise as encoder test input triggered a genuine ASIC
-  "bitstream overflow" hardware reset (visible in `dmesg`) — synthetic test
-  textures for any future encoder-backend work need to stay compressible.
+  `src/backends/spike_mpp_mdinfo.c`), but with two confirmed defects and one
+  unresolved question, none of which appear in the public MPP repo or a web
+  search at the time this was written (the HAL source only wires a buffer fd
+  to a hardware register; the bit layout itself is ASIC-generated) — though
+  the same symptoms turned up independently: **github.com/rockchip-linux/mpp
+  issue #825** reports the exact same "only half the frame" and "mvy=32"
+  behavior on RK3588, unresolved as of this writing.
+  - Motion data is only written for the top ~half of a frame's MB-rows
+    (confirmed at 3 heights: 96/192/384px, split almost exactly in half,
+    every run).
+  - Real motion data only appears at even 16-wide raw block columns; odd
+    columns carry a fixed value (mvx=248, mvy=32) while SAD still varies
+    genuinely per-block. Hand-verified at the bit level across dozens of
+    blocks: every odd-column word's upper 16 bits were identical
+    (`0x207c`) while the lower 16 bits tracked content — a real defect in
+    how paired ME lanes commit their MV, not a stride/read bug (which
+    would produce incoherent garbage, not a clean, consistent split).
+    **This one is easy to falsely "un-find"**: an earlier pass in this
+    project's own history concluded it "doesn't reproduce" after several
+    clean-looking runs, purely because the check script was only looking
+    for an unrelated pre-fill sentinel and could never have detected this
+    specific pattern. Re-confirmed once checked for directly — reproduced
+    on every run, three different test textures including per-pixel
+    noise. If this comes up again, verify by checking for the actual
+    (248, 32) values, not just "no sentinel."
+  - mvx/mvy units are assumed quarter-pel (empirically closest, not
+    vendor-confirmed) — but a per-pixel-noise exact-shift test's
+    genuinely-computed SAD values came back low but non-zero, which a
+    perfect match against unmodified noise shouldn't produce. This looks
+    entangled with the column defect above (the search/predictor
+    mechanism affected by it may not be finding the true best match even
+    on the "trustworthy" column) rather than being purely a unit-scaling
+    question.
+
+  `cs_backend_rkmpp.c`'s file header has the full account. A real,
+  incidental lesson from the same investigation: pure per-pixel noise as
+  encoder test input triggered a genuine ASIC "bitstream overflow" hardware
+  reset (visible in `dmesg`) on an under-sized output buffer — synthetic
+  test textures for any future encoder-backend work need to stay
+  compressible, or the output buffer needs generous headroom (this project
+  used 3x the raw frame size).
 - **Code-complete, never run**: `d3d12_vme`. No C++ toolchain was available
   on the Windows machine, and installing one needs admin elevation this
   session couldn't obtain. Its sign-convention and precision/block-size
