@@ -21,9 +21,22 @@
  * This costs a real decode pass -- CS_MODE_ENCODE_DECODE, not
  * CS_MODE_ENCODE_READBACK -- trading away part of the "no decode needed"
  * speed advantage encode+readback promised, in exchange for correctness.
- * Whether that trade is worth it in practice is exactly what running
- * tests/test_calibration and cs_bench against this backend will show;
- * that hasn't been done yet as of this file's creation.
+ * Measured (CS_RKMPP_HWENC_TIMING, 1920x1080, qp=45): of ~93ms total,
+ * software decode is ~57ms (61%) and the *I-frame's* decode alone is
+ * ~51ms of that -- the P-frame (the one we actually need MVs from) only
+ * takes ~6ms. The I-frame's CABAC entropy decode dominates, and that
+ * scales with how much detail got coded (QP), not with reconstruction
+ * work: CS_RKMPP_HWENC_SKIP_RECON (skip_idct/skip_loop_filter, since we
+ * never look at decoded pixels) saved under 10% -- entropy decode still
+ * has to fully parse every coded coefficient to know how many bits to
+ * consume, whether or not the IDCT is later applied to them. Raising QP
+ * is the lever that actually works: qp=12 (default, this backend's own
+ * accuracy-first choice, matching lavc_sw/rkmpp's rationale) produces a
+ * ~2.2MB I-frame and ~386ms total; qp=45 produces a ~327KB I-frame and
+ * ~93ms total, with disparity accuracy on a synthetic known-shift pair
+ * unaffected (still exact to within 16.0 +/- ~1px at the edges). A
+ * genuinely separate, coarser I-frame-only QP was attempted (qp_i,
+ * below) and confirmed NOT to work under MPP_ENC_RC_MODE_FIXQP.
  *
  * MPP_ENC_HEADER_MODE_EACH_IDR makes the encoder prepend inline SPS/PPS
  * NAL units to every IDR frame's own packet (matching the official MPP
@@ -46,14 +59,44 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/motion_vector.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* Set CS_RKMPP_HWENC_TIMING to any value to print a phase-by-phase
+   breakdown to stderr: MPP setup, HW encode, MPP teardown, decoder open,
+   and SW decode (per packet) -- see cs_bench's own median-of-N harness for
+   whole-call timing; this is for finding out *where* the time goes inside
+   one call. */
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 #define RK_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
 typedef struct rkmpp_hwenc_ctx {
     int block_w, block_h;
-    int qp;
+    int qp;    /* nominal QP; also the P-frame's actual QP */
+    int qp_i;  /* intended as a separate, coarser I-frame QP (see below) --
+                  VERIFIED NOT TO WORK under MPP_ENC_RC_MODE_FIXQP: tested
+                  qp=12/qp_i=45 expecting a small I-frame + precise P-frame,
+                  but the P-frame's encoded size came back identical to a
+                  uniform qp=45 run, not a uniform qp=12 run -- rc:qp_init
+                  (set to qp_i, since frame 0 is our I-frame) ends up
+                  governing the *entire* encode, and rc:qp_max/min (the
+                  intended P-frame bound) is ignored. This matches
+                  Rockchip's own reference usage (MPP's mpi_enc_test.c sets
+                  qp_init/qp_max/qp_min/qp_max_i/qp_min_i all to one
+                  identical value for FIXQP): FIXQP appears to mean exactly
+                  what it says, ONE fixed QP for the whole sequence, with no
+                  per-frame-type override. Real asymmetric I/P QP would need
+                  a different rc:mode (CBR/VBR with qp_ip delta), not
+                  attempted here. Left in place (currently equivalent to
+                  just "qp=") since it's harmless and documents a real,
+                  verified dead end rather than silently re-discovering it. */
     int32_t disparity_offset;
 
     int cols, rows;
@@ -88,11 +131,14 @@ static int rkmpp_hwenc_init(void *vctx, const cs_config *cfg) {
     ctx->block_w = cfg->block_w > 0 ? cfg->block_w : 16;
     ctx->block_h = cfg->block_h > 0 ? cfg->block_h : 16;
     ctx->qp = 12;
+    ctx->qp_i = 12; /* default: uniform QP, matching lavc_sw/rkmpp's own default */
     ctx->disparity_offset = cfg->disparity_offset;
 
     if (cfg->backend_params) {
         const char *p = strstr(cfg->backend_params, "qp=");
-        if (p) ctx->qp = atoi(p + 3);
+        if (p) { ctx->qp = atoi(p + 3); ctx->qp_i = ctx->qp; }
+        const char *pi = strstr(cfg->backend_params, "qp_i=");
+        if (pi) ctx->qp_i = atoi(pi + 5); /* explicit override wins over qp='s default */
     }
     return 0;
 }
@@ -176,6 +222,9 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
     AVPacket *pkt_i = NULL, *pkt_p = NULL;
     AVFrame *dec_frame = NULL;
 
+    int timing = getenv("CS_RKMPP_HWENC_TIMING") != NULL;
+    double t0 = timing ? now_ms() : 0;
+
     if (mpp_create(&mctx, &mpi) != MPP_OK) goto done;
     if (mpp_init(mctx, MPP_CTX_ENC, MPP_VIDEO_CodingAVC) != MPP_OK) goto done;
     if (mpp_buffer_group_get_internal(&buf_grp, MPP_BUFFER_TYPE_DMA_HEAP) != MPP_OK) goto done;
@@ -219,11 +268,11 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
     mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denom", 1);
     mpp_enc_cfg_set_s32(cfg, "rc:gop", 2);
 
-    mpp_enc_cfg_set_s32(cfg, "rc:qp_init", ctx->qp);
+    mpp_enc_cfg_set_s32(cfg, "rc:qp_init", ctx->qp_i); /* frame 0 = our I-frame */
     mpp_enc_cfg_set_s32(cfg, "rc:qp_max", ctx->qp);
     mpp_enc_cfg_set_s32(cfg, "rc:qp_min", ctx->qp);
-    mpp_enc_cfg_set_s32(cfg, "rc:qp_max_i", ctx->qp);
-    mpp_enc_cfg_set_s32(cfg, "rc:qp_min_i", ctx->qp);
+    mpp_enc_cfg_set_s32(cfg, "rc:qp_max_i", ctx->qp_i);
+    mpp_enc_cfg_set_s32(cfg, "rc:qp_min_i", ctx->qp_i);
     mpp_enc_cfg_set_s32(cfg, "rc:qp_ip", 0);
 
     mpp_enc_cfg_set_s32(cfg, "codec:type", MPP_VIDEO_CodingAVC);
@@ -238,9 +287,12 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
         if (mpi->control(mctx, MPP_ENC_SET_HEADER_MODE, &header_mode) != MPP_OK) goto done;
     }
 
+    double t_setup_done = timing ? now_ms() : 0;
+
     MppBuffer frm_bufs[2] = {frm_buf_l, frm_buf_r};
     MppBuffer pkt_bufs[2] = {pkt_buf_l, pkt_buf_r};
     for (int i = 0; i < 2; i++) {
+        double t_frame_start = timing ? now_ms() : 0;
         MppFrame frame = NULL;
         MppPacket packet = NULL;
 
@@ -273,7 +325,13 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
 
         if (i == 0) { bitstream_i = copy; bitstream_i_len = len; }
         else        { bitstream_p = copy; bitstream_p_len = len; }
+
+        if (timing)
+            fprintf(stderr, "TIMING hw_encode[%d] %.3f ms (%zu bytes)\n",
+                    i, now_ms() - t_frame_start, len);
     }
+
+    double t_encode_done = timing ? now_ms() : 0;
 
     /* Done with MPP -- everything past here is a plain software H.264
        decode of the hardware encoder's own bitstream, identical in
@@ -286,14 +344,27 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
     mpp_buffer_group_put(buf_grp); buf_grp = NULL;
     mpp_destroy(mctx); mctx = NULL;
 
+    double t_teardown_done = timing ? now_ms() : 0;
+
     {
         const AVCodec *dec_codec = avcodec_find_decoder(AV_CODEC_ID_H264);
         if (!dec_codec) goto done;
         dec_ctx = avcodec_alloc_context3(dec_codec);
         if (!dec_ctx) goto done;
         dec_ctx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
+        if (getenv("CS_RKMPP_HWENC_SKIP_RECON")) {
+            /* We only need parsed MVs, not reconstructed pixels -- try
+               skipping IDCT/residual reconstruction and the deblocking
+               filter, both normally-mandatory decode stages that MV
+               export doesn't depend on (MV values and their predictors
+               come from parsed syntax + neighbor MVs, not pixels). */
+            dec_ctx->skip_idct = AVDISCARD_ALL;
+            dec_ctx->skip_loop_filter = AVDISCARD_ALL;
+        }
         if (avcodec_open2(dec_ctx, dec_codec, NULL) < 0) goto done;
     }
+
+    double t_decoder_open_done = timing ? now_ms() : 0;
 
     pkt_i = av_packet_alloc();
     pkt_p = av_packet_alloc();
@@ -310,6 +381,7 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
 
     AVPacket *dec_inputs[2] = {pkt_i, pkt_p};
     for (int i = 0; i < 2; i++) {
+        double t_pkt_start = timing ? now_ms() : 0;
         if (avcodec_send_packet(dec_ctx, dec_inputs[i]) < 0) goto done;
         for (;;) {
             int r = avcodec_receive_frame(dec_ctx, dec_frame);
@@ -348,6 +420,21 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
             }
             av_frame_unref(dec_frame);
         }
+        if (timing)
+            fprintf(stderr, "TIMING sw_decode[%d] %.3f ms (%zu bytes)\n",
+                    i, now_ms() - t_pkt_start, (size_t)dec_inputs[i]->size);
+    }
+
+    if (timing) {
+        double t_all_done = now_ms();
+        fprintf(stderr,
+                "TIMING mpp_setup=%.3f hw_encode_total=%.3f mpp_teardown=%.3f "
+                "decoder_open=%.3f sw_decode_total=%.3f overall=%.3f (ms)\n",
+                t_setup_done - t0, t_encode_done - t_setup_done,
+                t_teardown_done - t_encode_done,
+                t_decoder_open_done - t_teardown_done,
+                t_all_done - t_decoder_open_done,
+                t_all_done - t0);
     }
 
     out->dx = ctx->dx;

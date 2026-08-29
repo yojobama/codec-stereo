@@ -54,6 +54,8 @@ int main(int argc, char **argv) {
             cfg.disparity_offset = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--min-disparity") == 0 && i + 1 < argc) {
             min_disparity = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--params") == 0 && i + 1 < argc) {
+            cfg.backend_params = argv[++i];
         } else if (strcmp(argv[i], "--cross-check") == 0) {
             do_cross_check = 1;
         } else if (strcmp(argv[i], "--upsample") == 0 && i + 1 < argc) {

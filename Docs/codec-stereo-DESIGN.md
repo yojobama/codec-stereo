@@ -383,6 +383,30 @@ Sec. 3's non-functional requirements originally hoped for:
    slower than at QP=45, because a much bigger, more detailed bitstream is
    proportionally more expensive to *decode*, not just to produce.
 
+**Where exactly the `rkmpp_hwenc` time goes** (`CS_RKMPP_HWENC_TIMING`,
+1920×1080, qp=45, one call): of ~93ms total, HW encode is ~10ms, MPP
+setup/teardown ~25ms, and software decode is **~57ms (61%)** -- and within
+that decode time, the **I-frame alone is ~51ms of the 57ms**. The P-frame,
+the one this backend actually needs motion vectors from, decodes in ~6ms.
+The I-frame's CABAC entropy decode dominates, and that cost tracks how much
+detail got *coded* (QP), not how much reconstruction work follows:
+`CS_RKMPP_HWENC_SKIP_RECON` (skip IDCT + deblocking, since decoded pixels are
+never inspected) saved under 10% -- entropy decode still has to fully parse
+every coded coefficient to know how many bits to consume, whether or not an
+IDCT is later applied to them. A genuinely separate, coarser I-frame-only QP
+(`qp_i` in `cs_backend_rkmpp_hwenc.c`) was tried next and confirmed **not**
+to work under `MPP_ENC_RC_MODE_FIXQP` -- `rc:qp_init` (necessarily the
+I-frame's QP, since frame 0 is the I-frame) ends up governing the whole
+encode, and `rc:qp_max`/`rc:qp_min` (the intended P-frame-only bound) are
+ignored; this matches how Rockchip's own `mpi_enc_test.c` sets all of
+`qp_init`/`qp_max`/`qp_min`/`qp_max_i`/`qp_min_i` to one identical value for
+FIXQP, i.e. the mode appears to mean literally one fixed QP for the whole
+sequence. Real per-frame-type QP would need a different `rc:mode` (CBR/VBR
+with a `qp_ip` delta), not attempted here. The lever that *does* work,
+verified on a synthetic known-shift pair with no accuracy loss (disparity
+still exact within ~1px at the frame edges): just raise the shared QP.
+qp=12 → ~2.2MB I-frame, ~386ms total; qp=45 → ~327KB I-frame, ~93ms total.
+
 ## 10. Resolved / Open Questions
 
 Resolved by implementation:
