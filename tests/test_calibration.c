@@ -91,61 +91,78 @@ static int run_backend(const char *name) {
         return 1;
     }
 
-    cs_mv_field field = {0};
-    if (cs_extract(ctx, &lf, &rf, &field) != 0) {
-        printf("[%-10s] FAIL: cs_extract returned nonzero\n", name);
-        cs_destroy(ctx);
-        free(left); free(right);
-        return 1;
-    }
-
-    float *disp = (float *)malloc((size_t)field.cols * field.rows * sizeof(float));
-    cs_disparity_config dcfg = {0};
-    dcfg.fx = 1.0f;
-    dcfg.baseline = 1.0f;
-    dcfg.min_disparity = 0.5f;
-    dcfg.max_dy = 2;
-    dcfg.max_cost = 0; /* don't gate on cost: some backends report none */
-    cs_mv_field_to_disparity(&field, &dcfg, disp);
-
     /*
-     * The outermost column on each side is genuinely unmatched-by-
-     * construction, and *which* side depends on which frame a backend's
-     * block grid is anchored to: a LEFT-anchored backend (ref_sad) has no
-     * valid target for its last column (the shifted search target falls
-     * past RIGHT's edge); a RIGHT-anchored backend, following H.264's
-     * raster order on the P-frame (lavc_sw), has no valid source for its
-     * first column (there's no corresponding LEFT content, since LEFT is
-     * the later crop of the source image). Exclude both unconditionally
-     * rather than special-case per backend -- only interior columns have
-     * a well-defined answer for every anchor convention.
+     * Run cs_extract REPEATEDLY on the same cs_context, not just once.
+     * A backend that reuses persistent state across calls (encoder/decoder
+     * contexts kept alive instead of recreated per call, an optimization
+     * worth making for real throughput -- see Docs Sec. 9's latency
+     * numbers) is exactly the kind of change that can pass on the first
+     * call and subtly corrupt the second: leftover GOP/reference-frame
+     * state, a wrongly-reused buffer, a flush that doesn't fully reset
+     * decoder state. A single-call test would never catch that class of
+     * bug at all.
      */
-    int checked = 0;
-    for (int by = 0; by < field.rows; by++) {
-        for (int bx = 1; bx < field.cols - 1; bx++) {
-            size_t idx = (size_t)by * field.cols + bx;
-            float d = disp[idx];
-            if (d == CS_DISPARITY_INVALID) {
-                printf("[%-10s] FAIL: block (%d,%d) invalid disparity\n", name, bx, by);
-                failed = 1;
-                continue;
-            }
-            if (fabsf(d - (float)SHIFT_PX) > 1.0f) {
-                printf("[%-10s] FAIL: block (%d,%d) disparity=%.3f, expected ~%.1f\n",
-                       name, bx, by, d, (float)SHIFT_PX);
-                failed = 1;
-                continue;
-            }
-            checked++;
+    const int reps = 3;
+    int checked_total = 0;
+    int last_mode = 0, last_subpel = 0;
+
+    for (int rep = 0; rep < reps && !failed; rep++) {
+        cs_mv_field field = {0};
+        if (cs_extract(ctx, &lf, &rf, &field) != 0) {
+            printf("[%-10s] FAIL: cs_extract returned nonzero (rep %d)\n", name, rep);
+            failed = 1;
+            break;
         }
+
+        float *disp = (float *)malloc((size_t)field.cols * field.rows * sizeof(float));
+        cs_disparity_config dcfg = {0};
+        dcfg.fx = 1.0f;
+        dcfg.baseline = 1.0f;
+        dcfg.min_disparity = 0.5f;
+        dcfg.max_dy = 2;
+        dcfg.max_cost = 0; /* don't gate on cost: some backends report none */
+        cs_mv_field_to_disparity(&field, &dcfg, disp);
+
+        /*
+         * The outermost column on each side is genuinely unmatched-by-
+         * construction, and *which* side depends on which frame a backend's
+         * block grid is anchored to: a LEFT-anchored backend (ref_sad) has no
+         * valid target for its last column (the shifted search target falls
+         * past RIGHT's edge); a RIGHT-anchored backend, following H.264's
+         * raster order on the P-frame (lavc_sw), has no valid source for its
+         * first column (there's no corresponding LEFT content, since LEFT is
+         * the later crop of the source image). Exclude both unconditionally
+         * rather than special-case per backend -- only interior columns have
+         * a well-defined answer for every anchor convention.
+         */
+        for (int by = 0; by < field.rows; by++) {
+            for (int bx = 1; bx < field.cols - 1; bx++) {
+                size_t idx = (size_t)by * field.cols + bx;
+                float d = disp[idx];
+                if (d == CS_DISPARITY_INVALID) {
+                    printf("[%-10s] FAIL: block (%d,%d) invalid disparity (rep %d)\n", name, bx, by, rep);
+                    failed = 1;
+                    continue;
+                }
+                if (fabsf(d - (float)SHIFT_PX) > 1.0f) {
+                    printf("[%-10s] FAIL: block (%d,%d) disparity=%.3f, expected ~%.1f (rep %d)\n",
+                           name, bx, by, d, (float)SHIFT_PX, rep);
+                    failed = 1;
+                    continue;
+                }
+                checked_total++;
+            }
+        }
+
+        last_mode = (int)cs_get_caps(ctx).mode;
+        last_subpel = field.subpel_bits;
+        free(disp);
     }
 
     if (!failed) {
-        printf("[%-10s] PASS (%d blocks checked, mode=%d, subpel_bits=%d)\n",
-               name, checked, (int)cs_get_caps(ctx).mode, field.subpel_bits);
+        printf("[%-10s] PASS (%d blocks checked over %d reps, mode=%d, subpel_bits=%d)\n",
+               name, checked_total, reps, last_mode, last_subpel);
     }
-
-    free(disp);
     cs_destroy(ctx);
     free(left);
     free(right);
