@@ -366,7 +366,8 @@ Sec. 6):
 | `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | CABAC (old default) | 386 ms |
 | `rkmpp_hwenc` | Orange Pi | 45 | CABAC | 99 ms |
 | `rkmpp_hwenc` | Orange Pi | 45 | CAVLC | 69 ms |
-| `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | **CAVLC (new default)** | **94 ms** |
+| `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | CAVLC, fresh context/call | 94 ms |
+| `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | **CAVLC, persistent context (current)** | **56 ms steady-state** (88 ms first call) |
 
 \* These two rows are the very first measurements taken in this project,
 before `lavc_sw` had any explicit CABAC/CAVLC control at all -- and they
@@ -391,11 +392,47 @@ Three things worth taking away from this table, since none of them match
 what Sec. 3's non-functional requirements originally hoped for:
 
 1. **`rkmpp`'s 36-49ms (Sec. 12) is nowhere near "single-digit milliseconds."**
-   The most likely reason: every backend here re-creates its encoder context
-   from scratch on every call (a deliberate correctness-over-speed choice,
-   Sec. 6) rather than reusing one long-lived context — that setup/teardown
-   plausibly dominates the number, not the ASIC's actual search time. Nobody
-   has measured the two apart.
+   Measured and confirmed for `rkmpp_hwenc`: per-call MPP context/buffer-group
+   setup was ~24ms and teardown ~8ms, versus `hw_encode_total` (the ASIC's
+   own work) of only ~10-11ms -- more than half of every call was pure
+   context churn unrelated to the encoder's actual throughput. Fixed by
+   making the MPP context, its 4 buffers, and the software decoder context
+   all persistent in `cs_backend_rkmpp_hwenc.c` (created lazily on first
+   use, torn down only in `rkmpp_hwenc_destroy`, recreated only if the
+   frame size changes): each call now forces its own IDR via
+   `MPP_ENC_SET_IDR_FRAME` instead of relying on `rc:gop`'s periodic
+   counting to land on a call boundary, never sets MPP's `eos` flag
+   (which would tell it the whole stream had ended), and calls
+   `avcodec_flush_buffers()` on the persistent decoder before each call's
+   packets, the same way it's normally used across a seek to an unrelated
+   point in a stream. Steady-state `mpp_setup` dropped from ~24ms to
+   ~1.1ms and `mpp_teardown`/`decoder_open` to near-zero. Combined with a
+   second small fix (the flat-128 chroma fill was re-stamping the *entire*
+   frame buffer, including the luma region about to be overwritten anyway,
+   on every single call -- now done once per buffer allocation instead),
+   this took `rkmpp_hwenc` at its default settings from 94ms to **~56ms
+   steady-state** (first call after startup still pays ~88ms, matching
+   the one-time setup cost) -- **386ms -> 56ms overall, a 6.9x speedup**,
+   verified stable and correct over 50 consecutive calls and unchanged
+   accuracy on `tests/test_calibration`, which was extended to run every
+   backend through `cs_extract` 3 times on the same context specifically
+   to catch the class of bug this kind of change can introduce (stale
+   GOP/reference state, an incompletely-reset decoder) that a single-call
+   test structurally cannot.
+
+   This same overhead almost certainly still applies to `cs_backend_rkmpp`
+   (the direct `KEY_MOTION_INFO` path) and to `lavc_sw`, neither of which
+   received this treatment: `rkmpp` because its correctness bugs are the
+   bigger problem there, and `lavc_sw` because its own file header already
+   documents fresh-context-per-call as a deliberate choice for a backend
+   whose whole purpose is being a portable reference, not the fast path.
+   A further, unimplemented lever for actual sustained *throughput* (not
+   just per-call latency) would be pipelining -- overlapping pair N's
+   software decode (CPU-bound) with pair N+1's hardware encode (ASIC-bound,
+   a different resource) across an actual stream of pairs. `cs_extract`'s
+   synchronous, one-shot signature doesn't allow that; it would need an
+   async submit/poll-style API, which is a real design change, not
+   something to bolt on incidentally.
 2. **CABAC vs CAVLC is a real, large lever for *both* software-decode
    backends -- ~35-40% at matched QP, and up to 4.1x at `rkmpp_hwenc`'s
    accuracy-first QP=12 -- for two different reasons per backend.** A

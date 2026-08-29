@@ -57,6 +57,7 @@
 #include <rockchip/rk_venc_cmd.h>
 
 #include <libavcodec/avcodec.h>
+#include <libavutil/mem.h>
 #include <libavutil/motion_vector.h>
 
 #include <stdio.h>
@@ -102,6 +103,33 @@ typedef struct rkmpp_hwenc_ctx {
                   (larger bitstream, no sequential-arithmetic-coding
                   dependency chain -- worth testing since I-frame CABAC
                   entropy decode is this backend's dominant cost) */
+
+    /*
+     * Persistent MPP + decoder state, created lazily on the first
+     * extract() call and reused across calls at the same frame size --
+     * removes ~24-32ms/call of MPP context-create + buffer-group +
+     * 4-buffer-alloc, then mpp_destroy + buffer-group-put on the way out,
+     * none of which has anything to do with the ASIC's actual encode
+     * throughput (measured hw_encode_total is ~10-11ms regardless).
+     * Recreated only if the frame size changes; freed for good in
+     * rkmpp_hwenc_destroy(). Each call still gets a logically-independent
+     * 2-frame I+P sequence: MPP_ENC_SET_IDR_FRAME forces frame 0 back to
+     * IDR every call (rather than relying on rc:gop's own periodic-IDR
+     * counting to happen to land right), frames never set MPP's eos flag
+     * (that would tell MPP the whole stream just ended -- fine for a
+     * fresh-per-call context, wrong for a persistent one), and
+     * avcodec_flush_buffers() resets the decoder's DPB/reference state
+     * before every call's 2 packets, the same way avcodec_flush_buffers
+     * is normally used across a seek to a different, unrelated point in
+     * a stream.
+     */
+    int mpp_ready;
+    int cur_w, cur_h;
+    MppCtx mctx;
+    MppApi *mpi;
+    MppBufferGroup buf_grp;
+    MppBuffer frm_buf_l, frm_buf_r, pkt_buf_l, pkt_buf_r;
+    AVCodecContext *dec_ctx;
 
     int cols, rows;
     int16_t *dx, *dy;
@@ -185,92 +213,79 @@ static int ensure_buffers(rkmpp_hwenc_ctx *ctx, int cols, int rows) {
     return 0;
 }
 
-static int fill_nv12(MppBuffer buf, const uint8_t *luma, int stride,
-                      int w, int h, int hor_stride, int ver_stride) {
+/* Fills the whole buffer (luma padding included) with flat 128 -- see
+   lavc_sw/rkmpp's identical "flat chroma" choice. Only needed once per
+   buffer allocation now that frm_buf_l/r persist across calls (ensure_mpp_
+   context, right after mpp_buffer_get): chroma is never touched again by
+   fill_nv12 below, and stride padding beyond column w is never read by
+   the encoder in a way this project's own accuracy tests have found to
+   matter, so re-stamping ~1.5x the frame's worth of memory with the same
+   value on every single call was pure waste. */
+static int fill_flat128(MppBuffer buf, size_t frm_size) {
     uint8_t *p = (uint8_t *)mpp_buffer_get_ptr(buf);
     if (!p) return -1;
-    size_t frm_size = (size_t)hor_stride * ver_stride * 3 / 2;
     mpp_buffer_sync_begin(buf);
-    memset(p, 128, frm_size); /* flat chroma; see lavc_sw/rkmpp's identical choice */
+    memset(p, 128, frm_size);
+    mpp_buffer_sync_end(buf);
+    return 0;
+}
+
+/* Per-call: overwrite just the luma rows (chroma stays flat 128 from
+   fill_flat128, set once at allocation time). */
+static int fill_nv12_luma(MppBuffer buf, const uint8_t *luma, int stride,
+                           int w, int h, int hor_stride) {
+    uint8_t *p = (uint8_t *)mpp_buffer_get_ptr(buf);
+    if (!p) return -1;
+    mpp_buffer_sync_begin(buf);
     for (int y = 0; y < h; y++)
         memcpy(p + (size_t)y * hor_stride, luma + (size_t)y * stride, (size_t)w);
     mpp_buffer_sync_end(buf);
     return 0;
 }
 
-static int log2_pow2(int v, int fallback) {
-    if (v <= 0) return fallback;
-    int r = 0;
-    while ((1 << r) < v && r < 16) r++;
-    return (1 << r) == v ? r : fallback;
+static void teardown_mpp_context(rkmpp_hwenc_ctx *ctx) {
+    if (ctx->dec_ctx) avcodec_free_context(&ctx->dec_ctx);
+    if (ctx->frm_buf_l) { mpp_buffer_put(ctx->frm_buf_l); ctx->frm_buf_l = NULL; }
+    if (ctx->frm_buf_r) { mpp_buffer_put(ctx->frm_buf_r); ctx->frm_buf_r = NULL; }
+    if (ctx->pkt_buf_l) { mpp_buffer_put(ctx->pkt_buf_l); ctx->pkt_buf_l = NULL; }
+    if (ctx->pkt_buf_r) { mpp_buffer_put(ctx->pkt_buf_r); ctx->pkt_buf_r = NULL; }
+    if (ctx->buf_grp) { mpp_buffer_group_put(ctx->buf_grp); ctx->buf_grp = NULL; }
+    if (ctx->mctx) { mpp_destroy(ctx->mctx); ctx->mctx = NULL; }
+    ctx->mpi = NULL;
+    ctx->mpp_ready = 0;
 }
 
-static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame *right,
-                                cs_mv_field *out) {
-    rkmpp_hwenc_ctx *ctx = (rkmpp_hwenc_ctx *)vctx;
-    const int w = left->width, h = left->height;
-    if (right->width != w || right->height != h) return -1;
-
-    const int cols = (w + ctx->block_w - 1) / ctx->block_w;
-    const int rows = (h + ctx->block_h - 1) / ctx->block_h;
-    if (ensure_buffers(ctx, cols, rows) != 0) return -1;
-
-    for (int i = 0; i < cols * rows; i++) {
-        ctx->dx[i] = 0;
-        ctx->dy[i] = 0;
-        ctx->flags[i] = (uint8_t)(CS_BLK_INTRA | CS_BLK_NO_MATCH | CS_BLK_NO_COST);
-    }
+/* (Re)creates the persistent MPP encoder + decoder state for a given frame
+   size, tearing down any previous instance first. No-op if already set up
+   for this exact size (the common case: every call after the first). */
+static int ensure_mpp_context(rkmpp_hwenc_ctx *ctx, int w, int h) {
+    if (ctx->mpp_ready && ctx->cur_w == w && ctx->cur_h == h) return 0;
+    teardown_mpp_context(ctx);
 
     int hor_stride = RK_ALIGN(w, 64);
     int ver_stride = RK_ALIGN(h, 16);
     size_t frm_size = (size_t)hor_stride * ver_stride * 3 / 2;
-    size_t pkt_size = (size_t)hor_stride * ver_stride * 3; /* generous -- see rkmpp's
-        bitstream-overflow lesson */
+    size_t pkt_size = (size_t)hor_stride * ver_stride * 3; /* generous -- see
+        rkmpp's bitstream-overflow lesson */
 
-    int ret = -1;
-    MppCtx mctx = NULL;
-    MppApi *mpi = NULL;
-    MppBufferGroup buf_grp = NULL;
     MppEncCfg cfg = NULL;
-    MppBuffer frm_buf_l = NULL, frm_buf_r = NULL, pkt_buf_l = NULL, pkt_buf_r = NULL;
-    uint8_t *right_shifted = NULL;
-    uint8_t *bitstream_i = NULL, *bitstream_p = NULL;
-    size_t bitstream_i_len = 0, bitstream_p_len = 0;
+    int ok = 0;
 
-    AVCodecContext *dec_ctx = NULL;
-    AVPacket *pkt_i = NULL, *pkt_p = NULL;
-    AVFrame *dec_frame = NULL;
+    if (mpp_create(&ctx->mctx, &ctx->mpi) != MPP_OK) goto done;
+    if (mpp_init(ctx->mctx, MPP_CTX_ENC, MPP_VIDEO_CodingAVC) != MPP_OK) goto done;
+    if (mpp_buffer_group_get_internal(&ctx->buf_grp, MPP_BUFFER_TYPE_DMA_HEAP) != MPP_OK) goto done;
 
-    int timing = getenv("CS_RKMPP_HWENC_TIMING") != NULL;
-    double t0 = timing ? now_ms() : 0;
+    if (mpp_buffer_get(ctx->buf_grp, &ctx->frm_buf_l, frm_size) != MPP_OK) goto done;
+    if (mpp_buffer_get(ctx->buf_grp, &ctx->frm_buf_r, frm_size) != MPP_OK) goto done;
+    if (mpp_buffer_get(ctx->buf_grp, &ctx->pkt_buf_l, pkt_size) != MPP_OK) goto done;
+    if (mpp_buffer_get(ctx->buf_grp, &ctx->pkt_buf_r, pkt_size) != MPP_OK) goto done;
 
-    if (mpp_create(&mctx, &mpi) != MPP_OK) goto done;
-    if (mpp_init(mctx, MPP_CTX_ENC, MPP_VIDEO_CodingAVC) != MPP_OK) goto done;
-    if (mpp_buffer_group_get_internal(&buf_grp, MPP_BUFFER_TYPE_DMA_HEAP) != MPP_OK) goto done;
-
-    if (mpp_buffer_get(buf_grp, &frm_buf_l, frm_size) != MPP_OK) goto done;
-    if (mpp_buffer_get(buf_grp, &frm_buf_r, frm_size) != MPP_OK) goto done;
-    if (mpp_buffer_get(buf_grp, &pkt_buf_l, pkt_size) != MPP_OK) goto done;
-    if (mpp_buffer_get(buf_grp, &pkt_buf_r, pkt_size) != MPP_OK) goto done;
-
-    if (fill_nv12(frm_buf_l, left->data[0], left->stride[0], w, h, hor_stride, ver_stride) != 0)
-        goto done;
-
-    const uint8_t *right_luma = right->data[0];
-    int right_stride = right->stride[0];
-    if (ctx->disparity_offset != 0) {
-        right_shifted = (uint8_t *)malloc((size_t)w * h);
-        if (!right_shifted) goto done;
-        cs_shift_gray8(right->data[0], right->stride[0], right_shifted, w,
-                        w, h, -ctx->disparity_offset);
-        right_luma = right_shifted;
-        right_stride = w;
-    }
-    if (fill_nv12(frm_buf_r, right_luma, right_stride, w, h, hor_stride, ver_stride) != 0)
-        goto done;
+    /* Once per allocation, not once per call -- see fill_flat128's comment. */
+    if (fill_flat128(ctx->frm_buf_l, frm_size) != 0) goto done;
+    if (fill_flat128(ctx->frm_buf_r, frm_size) != 0) goto done;
 
     mpp_enc_cfg_init(&cfg);
-    if (mpi->control(mctx, MPP_ENC_GET_CFG, cfg) != MPP_OK) goto done;
+    if (ctx->mpi->control(ctx->mctx, MPP_ENC_GET_CFG, cfg) != MPP_OK) goto done;
 
     mpp_enc_cfg_set_s32(cfg, "prep:width", w);
     mpp_enc_cfg_set_s32(cfg, "prep:height", h);
@@ -299,17 +314,107 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
     mpp_enc_cfg_set_s32(cfg, "h264:level", 40);
     mpp_enc_cfg_set_s32(cfg, "h264:cabac_en", ctx->cabac);
 
-    if (mpi->control(mctx, MPP_ENC_SET_CFG, cfg) != MPP_OK) goto done;
+    if (ctx->mpi->control(ctx->mctx, MPP_ENC_SET_CFG, cfg) != MPP_OK) goto done;
 
     {
         RK_U32 header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
-        if (mpi->control(mctx, MPP_ENC_SET_HEADER_MODE, &header_mode) != MPP_OK) goto done;
+        if (ctx->mpi->control(ctx->mctx, MPP_ENC_SET_HEADER_MODE, &header_mode) != MPP_OK) goto done;
     }
+
+    {
+        const AVCodec *dec_codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+        if (!dec_codec) goto done;
+        ctx->dec_ctx = avcodec_alloc_context3(dec_codec);
+        if (!ctx->dec_ctx) goto done;
+        ctx->dec_ctx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
+        if (getenv("CS_RKMPP_HWENC_SKIP_RECON")) {
+            ctx->dec_ctx->skip_idct = AVDISCARD_ALL;
+            ctx->dec_ctx->skip_loop_filter = AVDISCARD_ALL;
+        }
+        if (avcodec_open2(ctx->dec_ctx, dec_codec, NULL) < 0) goto done;
+    }
+
+    ctx->cur_w = w;
+    ctx->cur_h = h;
+    ctx->mpp_ready = 1;
+    ok = 1;
+
+done:
+    if (cfg) mpp_enc_cfg_deinit(cfg);
+    if (!ok) teardown_mpp_context(ctx);
+    return ok ? 0 : -1;
+}
+
+static int log2_pow2(int v, int fallback) {
+    if (v <= 0) return fallback;
+    int r = 0;
+    while ((1 << r) < v && r < 16) r++;
+    return (1 << r) == v ? r : fallback;
+}
+
+static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame *right,
+                                cs_mv_field *out) {
+    rkmpp_hwenc_ctx *ctx = (rkmpp_hwenc_ctx *)vctx;
+    const int w = left->width, h = left->height;
+    if (right->width != w || right->height != h) return -1;
+
+    const int cols = (w + ctx->block_w - 1) / ctx->block_w;
+    const int rows = (h + ctx->block_h - 1) / ctx->block_h;
+    if (ensure_buffers(ctx, cols, rows) != 0) return -1;
+
+    for (int i = 0; i < cols * rows; i++) {
+        ctx->dx[i] = 0;
+        ctx->dy[i] = 0;
+        ctx->flags[i] = (uint8_t)(CS_BLK_INTRA | CS_BLK_NO_MATCH | CS_BLK_NO_COST);
+    }
+
+    int hor_stride = RK_ALIGN(w, 64);
+    int ver_stride = RK_ALIGN(h, 16);
+
+    int ret = -1;
+    uint8_t *right_shifted = NULL;
+    uint8_t *bitstream_i = NULL, *bitstream_p = NULL; /* av_malloc'd, padded --
+        ownership transfers to pkt_i/pkt_p via av_packet_from_data below, so
+        these are NOT freed directly in `done:` except on an early failure
+        before that transfer happens */
+    size_t bitstream_i_len = 0, bitstream_p_len = 0;
+
+    AVPacket *pkt_i = NULL, *pkt_p = NULL;
+    AVFrame *dec_frame = NULL;
+
+    int timing = getenv("CS_RKMPP_HWENC_TIMING") != NULL;
+    double t0 = timing ? now_ms() : 0;
+
+    if (ensure_mpp_context(ctx, w, h) != 0) goto done;
+    MppCtx mctx = ctx->mctx;
+    MppApi *mpi = ctx->mpi;
+
+    if (fill_nv12_luma(ctx->frm_buf_l, left->data[0], left->stride[0], w, h, hor_stride) != 0)
+        goto done;
+
+    const uint8_t *right_luma = right->data[0];
+    int right_stride = right->stride[0];
+    if (ctx->disparity_offset != 0) {
+        right_shifted = (uint8_t *)malloc((size_t)w * h);
+        if (!right_shifted) goto done;
+        cs_shift_gray8(right->data[0], right->stride[0], right_shifted, w,
+                        w, h, -ctx->disparity_offset);
+        right_luma = right_shifted;
+        right_stride = w;
+    }
+    if (fill_nv12_luma(ctx->frm_buf_r, right_luma, right_stride, w, h, hor_stride) != 0)
+        goto done;
+
+    /* Every call is logically an independent 2-frame I+P sequence even
+       though the MPP context now persists -- force frame 0 back to IDR
+       explicitly rather than relying on rc:gop's periodic-IDR counting to
+       happen to land on a call boundary. */
+    if (mpi->control(mctx, MPP_ENC_SET_IDR_FRAME, NULL) != MPP_OK) goto done;
 
     double t_setup_done = timing ? now_ms() : 0;
 
-    MppBuffer frm_bufs[2] = {frm_buf_l, frm_buf_r};
-    MppBuffer pkt_bufs[2] = {pkt_buf_l, pkt_buf_r};
+    MppBuffer frm_bufs[2] = {ctx->frm_buf_l, ctx->frm_buf_r};
+    MppBuffer pkt_bufs[2] = {ctx->pkt_buf_l, ctx->pkt_buf_r};
     for (int i = 0; i < 2; i++) {
         double t_frame_start = timing ? now_ms() : 0;
         MppFrame frame = NULL;
@@ -321,7 +426,9 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
         mpp_frame_set_hor_stride(frame, hor_stride);
         mpp_frame_set_ver_stride(frame, ver_stride);
         mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
-        mpp_frame_set_eos(frame, i == 1 ? 1 : 0);
+        /* eos deliberately never set: that tells MPP the whole stream has
+           ended, which is wrong for a context meant to keep serving future
+           calls (see the struct comment above). */
         mpp_frame_set_buffer(frame, frm_bufs[i]);
 
         mpp_packet_init_with_buffer(&packet, pkt_bufs[i]);
@@ -337,9 +444,14 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
 
         void *pos = mpp_packet_get_pos(out_packet);
         size_t len = mpp_packet_get_length(out_packet);
-        uint8_t *copy = (uint8_t *)malloc(len);
+        /* av_malloc (not plain malloc) with AV_INPUT_BUFFER_PADDING_SIZE
+           slack so this buffer can be handed directly to av_packet_from_data
+           below with no second copy into a separately-allocated AVPacket
+           buffer (av_new_packet + memcpy, as this used to do). */
+        uint8_t *copy = (uint8_t *)av_malloc(len + AV_INPUT_BUFFER_PADDING_SIZE);
         if (!copy) { mpp_packet_deinit(&out_packet); goto done; }
         memcpy(copy, pos, len);
+        memset(copy + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         mpp_packet_deinit(&out_packet);
 
         if (i == 0) { bitstream_i = copy; bitstream_i_len = len; }
@@ -352,36 +464,16 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
 
     double t_encode_done = timing ? now_ms() : 0;
 
-    /* Done with MPP -- everything past here is a plain software H.264
-       decode of the hardware encoder's own bitstream, identical in
-       spirit to cs_backend_lavc_sw's decode side. */
-    mpp_enc_cfg_deinit(cfg); cfg = NULL;
-    mpp_buffer_put(frm_buf_l); frm_buf_l = NULL;
-    mpp_buffer_put(frm_buf_r); frm_buf_r = NULL;
-    mpp_buffer_put(pkt_buf_l); pkt_buf_l = NULL;
-    mpp_buffer_put(pkt_buf_r); pkt_buf_r = NULL;
-    mpp_buffer_group_put(buf_grp); buf_grp = NULL;
-    mpp_destroy(mctx); mctx = NULL;
+    /* Done with MPP for this call -- mctx/buffers persist for the next one
+       (freed only in rkmpp_hwenc_destroy). Everything past here is a plain
+       software H.264 decode of the hardware encoder's own bitstream,
+       identical in spirit to cs_backend_lavc_sw's decode side. */
+    avcodec_flush_buffers(ctx->dec_ctx); /* reset DPB/reference state from
+        any previous call, same use as across a seek to an unrelated point
+        in a stream */
 
-    double t_teardown_done = timing ? now_ms() : 0;
-
-    {
-        const AVCodec *dec_codec = avcodec_find_decoder(AV_CODEC_ID_H264);
-        if (!dec_codec) goto done;
-        dec_ctx = avcodec_alloc_context3(dec_codec);
-        if (!dec_ctx) goto done;
-        dec_ctx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
-        if (getenv("CS_RKMPP_HWENC_SKIP_RECON")) {
-            /* We only need parsed MVs, not reconstructed pixels -- try
-               skipping IDCT/residual reconstruction and the deblocking
-               filter, both normally-mandatory decode stages that MV
-               export doesn't depend on (MV values and their predictors
-               come from parsed syntax + neighbor MVs, not pixels). */
-            dec_ctx->skip_idct = AVDISCARD_ALL;
-            dec_ctx->skip_loop_filter = AVDISCARD_ALL;
-        }
-        if (avcodec_open2(dec_ctx, dec_codec, NULL) < 0) goto done;
-    }
+    double t_teardown_done = timing ? now_ms() : 0; /* kept for a stable
+        TIMING line shape; this phase is now ~free (flush only) */
 
     double t_decoder_open_done = timing ? now_ms() : 0;
 
@@ -389,10 +481,13 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
     pkt_p = av_packet_alloc();
     dec_frame = av_frame_alloc();
     if (!pkt_i || !pkt_p || !dec_frame) goto done;
-    if (av_new_packet(pkt_i, (int)bitstream_i_len) < 0) goto done;
-    if (av_new_packet(pkt_p, (int)bitstream_p_len) < 0) goto done;
-    memcpy(pkt_i->data, bitstream_i, bitstream_i_len);
-    memcpy(pkt_p->data, bitstream_p, bitstream_p_len);
+    /* Takes ownership of bitstream_i/bitstream_p (av_malloc'd with padding
+       above) -- no further copy, and `done:` must not free them itself
+       once this succeeds. */
+    if (av_packet_from_data(pkt_i, bitstream_i, (int)bitstream_i_len) < 0) goto done;
+    bitstream_i = NULL;
+    if (av_packet_from_data(pkt_p, bitstream_p, (int)bitstream_p_len) < 0) goto done;
+    bitstream_p = NULL;
     pkt_i->pts = 0;
     pkt_p->pts = 1;
 
@@ -401,9 +496,9 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
     AVPacket *dec_inputs[2] = {pkt_i, pkt_p};
     for (int i = 0; i < 2; i++) {
         double t_pkt_start = timing ? now_ms() : 0;
-        if (avcodec_send_packet(dec_ctx, dec_inputs[i]) < 0) goto done;
+        if (avcodec_send_packet(ctx->dec_ctx, dec_inputs[i]) < 0) goto done;
         for (;;) {
-            int r = avcodec_receive_frame(dec_ctx, dec_frame);
+            int r = avcodec_receive_frame(ctx->dec_ctx, dec_frame);
             if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) break;
             if (r < 0) goto done;
 
@@ -469,25 +564,23 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
 
 done:
     free(right_shifted);
-    free(bitstream_i);
-    free(bitstream_p);
+    /* av_malloc'd (not plain malloc) -- only still non-NULL here if
+       av_packet_from_data was never reached/failed, i.e. ownership never
+       transferred to pkt_i/pkt_p. */
+    av_free(bitstream_i);
+    av_free(bitstream_p);
     if (pkt_i) av_packet_free(&pkt_i);
     if (pkt_p) av_packet_free(&pkt_p);
     if (dec_frame) av_frame_free(&dec_frame);
-    if (dec_ctx) avcodec_free_context(&dec_ctx);
-    if (cfg) mpp_enc_cfg_deinit(cfg);
-    if (frm_buf_l) mpp_buffer_put(frm_buf_l);
-    if (frm_buf_r) mpp_buffer_put(frm_buf_r);
-    if (pkt_buf_l) mpp_buffer_put(pkt_buf_l);
-    if (pkt_buf_r) mpp_buffer_put(pkt_buf_r);
-    if (buf_grp) mpp_buffer_group_put(buf_grp);
-    if (mctx) mpp_destroy(mctx);
+    /* mctx, mpi, and all MPP buffers/the decoder context persist in ctx
+       for the next call -- freed only in rkmpp_hwenc_destroy(). */
     return ret;
 }
 
 static void rkmpp_hwenc_destroy(void *vctx) {
     rkmpp_hwenc_ctx *ctx = (rkmpp_hwenc_ctx *)vctx;
     if (!ctx) return;
+    teardown_mpp_context(ctx);
     free(ctx->dx); free(ctx->dy); free(ctx->cost); free(ctx->flags);
     free(ctx);
 }
