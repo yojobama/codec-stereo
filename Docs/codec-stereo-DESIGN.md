@@ -368,6 +368,74 @@ Sec. 6):
 | `rkmpp_hwenc` | Orange Pi | 45 | CAVLC | 69 ms |
 | `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | CAVLC, fresh context/call | 94 ms |
 | `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | **CAVLC, persistent context (current)** | **56 ms steady-state** (88 ms first call) |
+| `rkmpp_hwenc` | Orange Pi | 12 (accuracy default) | **CAVLC, + stand-in IDR (current)** | **15.5 ms steady-state** |
+
+**Latency, final:** 386 ms -> 15.5 ms at 1080p, a **25x** speedup, from four
+changes in order: CAVLC instead of CABAC; a persistent MPP + decoder context
+instead of rebuilding both per call; a stand-in IDR so the real (multi-MB)
+I-frame is encoded but never decoded; and a one-time flat-chroma fill.
+Resolution scaling of the final version is close to linear in pixels
+(640x480 3.2 ms, 1920x1080 15.5 ms, 3840x2160 58.2 ms), with a fixed ~1 ms
+floor.
+
+Where the remaining 15.5 ms goes at 1080p: ~10.8 ms hardware encode (of
+which the P-frame's ~4.3 ms is the motion search itself -- the actual
+product), ~4.8 ms software decode, ~0.6 ms MPP submit. Two levers were
+tried against it and measured as **not** worth taking:
+
+- **Monochrome input** (`MPP_FMT_YUV400`, `mono=1` in `backend_params`):
+  implemented and correct, but only 15.28 -> 15.13 ms at 1080p, inside the
+  noise. The NV12 chroma plane this project always filled with a constant
+  128 turned out to cost the encoder almost nothing to code. Kept,
+  default-off, because it does cut input DMA by a third and might matter at
+  8K where bandwidth binds harder -- but on current evidence it buys
+  nothing.
+- **QP**: no longer a speed lever at all now that the I-frame isn't decoded
+  (19.7-19.9 ms flat across qp 12/20/28/36). Encode time is fixed per-pixel
+  ASIC work, not bitstream-size-bound. This *reverses* the earlier finding
+  in this same section, which was measured back when the I-frame's
+  bitstream had to be entropy-decoded and its size therefore dominated.
+
+## 9a. Throughput (cs_pipeline)
+
+Per-pair latency is bounded by a strictly sequential dependency chain
+(encode I -> encode P against it -> decode P), so nothing *inside* one call
+can overlap. But successive pairs are independent, and the work splits
+across two different pieces of silicon: RK3588 has **two** hardware encoder
+cores (`fdbd0000.rkvenc-core`, `fdbe0000.rkvenc-core` -- confirmed via
+`/proc/interrupts`, where the second core sat at exactly 0 interrupts until
+concurrent contexts were introduced), while the decode half is CPU-bound
+across 8 CPU cores.
+
+`cs_pipeline` (include/codec_stereo/cs_pipeline.h, src/cs_pipeline.cpp) is a
+worker pool of independent `cs_context`s exploiting exactly that. Measured
+pairs/s:
+
+| Resolution | 1 worker | best | speedup | at |
+|---|---|---|---|---|
+| 640x480 | 242 | **1143** | 4.7x | 8 workers |
+| 1920x1080 | 62 | **180** | 2.9x | 6 workers |
+| 3840x2160 | 14.7 | **32.8** | 2.2x | 6 workers |
+
+Throughput keeps climbing past 2 workers despite there being only 2 encoder
+cores, because the CPU-bound decode half interleaves with the ASIC-bound
+encode half rather than queueing behind it. It falls off again at 8 workers
+(both 1080p and 4K), where oversubscription costs more than it gains.
+
+Scaling is noticeably better at small frames (4.7x) than large (2.2x), which
+is a copy-cost effect: `cs_pipeline_submit()` copies both input planes on
+the *calling* thread, serializing that against everything the workers do in
+parallel -- ~4 MB/pair at 1080p. `cs_pipeline_submit_borrowed()` skips the
+copy in exchange for a documented lifetime contract (frames must outlive
+their result), and is worth 150.8 -> 180.5 pairs/s at 1080p.
+
+**Why this one file is C++.** The per-pair work is all in `cs_extract()`,
+which is C and untouched -- the language does nothing for it. What C++ buys
+is the queue plumbing: `std::thread`/`condition_variable` and RAII-owned
+job buffers, versus pthreads plus hand-rolled ownership across several
+allocation sites and a per-worker error path. The public interface stays C
+(`extern "C"`), so no other translation unit changes. There is no measured
+performance argument for converting anything else.
 
 \* These two rows are the very first measurements taken in this project,
 before `lavc_sw` had any explicit CABAC/CAVLC control at all -- and they

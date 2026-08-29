@@ -13,6 +13,7 @@ option(CS_ENABLE_D3D12   "Build the D3D12 Video Motion Estimation backend (Windo
 option(CS_BUILD_TOOLS    "Build CLI tools (cs_depth, cs_bench)" ON)
 option(CS_BUILD_TESTS    "Build unit tests" ON)
 option(CS_BUILD_HARNESS  "Build the OpenCV validation harness (needs OpenCV)" OFF)
+option(CS_BUILD_PIPELINE "Build the C++ throughput pipeline (cs_pipeline)" ON)
 
 add_library(codec_stereo
     src/cs_core.c
@@ -25,6 +26,16 @@ target_include_directories(codec_stereo
 )
 if(UNIX)
     target_link_libraries(codec_stereo PUBLIC m)
+endif()
+
+if(CS_BUILD_PIPELINE)
+    enable_language(CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    find_package(Threads REQUIRED)
+    target_sources(codec_stereo PRIVATE src/cs_pipeline.cpp)
+    target_compile_definitions(codec_stereo PUBLIC CS_BUILD_PIPELINE)
+    target_link_libraries(codec_stereo PUBLIC Threads::Threads)
 endif()
 
 if(CS_ENABLE_REF_SAD)
@@ -97,6 +108,12 @@ if(CS_BUILD_TESTS)
     add_executable(test_upsample_crosscheck tests/test_upsample_crosscheck.c)
     target_link_libraries(test_upsample_crosscheck PRIVATE codec_stereo)
     add_test(NAME upsample_crosscheck COMMAND test_upsample_crosscheck)
+
+    if(CS_BUILD_PIPELINE)
+        add_executable(test_pipeline tests/test_pipeline.c)
+        target_link_libraries(test_pipeline PRIVATE codec_stereo)
+        add_test(NAME pipeline COMMAND test_pipeline)
+    endif()
 endif()
 
 if(CS_BUILD_HARNESS)

@@ -99,6 +99,11 @@ typedef struct rkmpp_hwenc_ctx {
                   just "qp=") since it's harmless and documents a real,
                   verified dead end rather than silently re-discovering it. */
     int32_t disparity_offset;
+    int mono;  /* 1 = feed the encoder MPP_FMT_YUV400 (monochrome) instead of
+                  NV12. This project's frames are grayscale to begin with, so
+                  the NV12 chroma plane was always a constant 128 -- 1/3 of
+                  every byte DMA'd to the ASIC, plus whatever the encoder
+                  spends coding it, for no information at all. */
     int cabac; /* 1=CABAC (default, denser/slower to decode), 0=CAVLC
                   (larger bitstream, no sequential-arithmetic-coding
                   dependency chain -- worth testing since I-frame CABAC
@@ -206,6 +211,8 @@ static int rkmpp_hwenc_init(void *vctx, const cs_config *cfg) {
     if (cfg->backend_params) {
         const char *c = strstr(cfg->backend_params, "cabac=");
         if (c) ctx->cabac = atoi(c + 6);
+        const char *m = strstr(cfg->backend_params, "mono=");
+        if (m) ctx->mono = atoi(m + 5);
         const char *p = strstr(cfg->backend_params, "qp=");
         if (p) { ctx->qp = atoi(p + 3); ctx->qp_i = ctx->qp; }
         const char *pi = strstr(cfg->backend_params, "qp_i=");
@@ -285,7 +292,7 @@ static int encode_one_frame(rkmpp_hwenc_ctx *ctx, int w, int h,
     mpp_frame_set_height(frame, h);
     mpp_frame_set_hor_stride(frame, hor_stride);
     mpp_frame_set_ver_stride(frame, ver_stride);
-    mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
+    mpp_frame_set_fmt(frame, ctx->mono ? MPP_FMT_YUV400 : MPP_FMT_YUV420SP);
     /* eos deliberately never set: that tells MPP the whole stream has
        ended, which is wrong for a context meant to keep serving future
        calls (see the struct comment above). */
@@ -339,7 +346,8 @@ static int ensure_mpp_context(rkmpp_hwenc_ctx *ctx, int w, int h) {
 
     int hor_stride = RK_ALIGN(w, 64);
     int ver_stride = RK_ALIGN(h, 16);
-    size_t frm_size = (size_t)hor_stride * ver_stride * 3 / 2;
+    size_t frm_size = ctx->mono ? (size_t)hor_stride * ver_stride
+                                : (size_t)hor_stride * ver_stride * 3 / 2;
     size_t pkt_size = (size_t)hor_stride * ver_stride * 3; /* generous -- see
         rkmpp's bitstream-overflow lesson */
 
@@ -366,7 +374,8 @@ static int ensure_mpp_context(rkmpp_hwenc_ctx *ctx, int w, int h) {
     mpp_enc_cfg_set_s32(cfg, "prep:height", h);
     mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", hor_stride);
     mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", ver_stride);
-    mpp_enc_cfg_set_s32(cfg, "prep:format", MPP_FMT_YUV420SP);
+    mpp_enc_cfg_set_s32(cfg, "prep:format",
+                        ctx->mono ? MPP_FMT_YUV400 : MPP_FMT_YUV420SP);
 
     mpp_enc_cfg_set_s32(cfg, "rc:mode", MPP_ENC_RC_MODE_FIXQP);
     mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);

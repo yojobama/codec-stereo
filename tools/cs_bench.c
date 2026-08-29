@@ -10,6 +10,7 @@
  */
 
 #include "codec_stereo/cs.h"
+#include "codec_stereo/cs_pipeline.h"
 #include "codec_stereo/cs_util.h"
 
 #include <stdio.h>
@@ -40,6 +41,7 @@ static void fill_textured(uint8_t *buf, int n) {
 
 int main(int argc, char **argv) {
     int w = 1920, h = 1080, iters = 30;
+    int workers = 0; /* >0 selects the cs_pipeline throughput mode */
     cs_config cfg = {0};
 
     for (int i = 1; i < argc; i++) {
@@ -60,6 +62,8 @@ int main(int argc, char **argv) {
             cfg.search_range_y = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--params") == 0 && i + 1 < argc) {
             cfg.backend_params = argv[++i];
+        } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
+            workers = atoi(argv[++i]);
         } else {
             fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
             return 2;
@@ -74,16 +78,66 @@ int main(int argc, char **argv) {
     fill_textured(left, w * h);
     cs_shift_gray8(left, w, right, w, w, h, 4); /* small plausible disparity */
 
+    cs_frame lf = {0}, rf = {0};
+    lf.data[0] = left; lf.stride[0] = w; lf.width = w; lf.height = h; lf.fmt = CS_PIX_FMT_GRAY8;
+    rf.data[0] = right; rf.stride[0] = w; rf.width = w; rf.height = h; rf.fmt = CS_PIX_FMT_GRAY8;
+
+    /*
+     * Throughput mode: push `iters` pairs through a cs_pipeline worker pool
+     * and report aggregate pairs/s. This measures a different thing than the
+     * default latency mode -- per-pair latency is unchanged (and slightly
+     * worse, from queueing), but successive pairs overlap across the two
+     * hardware encoder cores and the CPU decode cores. See
+     * include/codec_stereo/cs_pipeline.h.
+     */
+    if (workers > 0) {
+        cs_disparity_config dcfg = {0};
+        dcfg.min_disparity = 0.5f;
+
+        cs_pipeline *pipe = cs_pipeline_create(&cfg, &dcfg, workers);
+        if (!pipe) {
+            fprintf(stderr, "cs_pipeline_create failed\n");
+            free(left); free(right);
+            return 1;
+        }
+
+        double t_start = now_ms();
+        int submitted = 0, received = 0, failures = 0;
+        while (received < iters) {
+            while (submitted < iters && submitted - received < workers * 2) {
+                /* Borrowed (zero-copy) is valid here because this benchmark
+                   feeds the same two immutable buffers to every pair, so the
+                   "stays alive and unmodified until retrieved" contract is
+                   trivially satisfied. A real streaming caller needs a
+                   rotating pool of >= workers*2 buffers instead. */
+                if (cs_pipeline_submit_borrowed(pipe, &lf, &rf) != 0) break;
+                submitted++;
+            }
+            cs_pipeline_result res;
+            if (cs_pipeline_get(pipe, &res) != 0) break;
+            if (res.status != 0) failures++;
+            received++;
+        }
+        double elapsed = now_ms() - t_start;
+
+        printf("mode:           pipeline (%d workers)\n", workers);
+        printf("frame size:     %dx%d\n", w, h);
+        printf("pairs:          %d (%d failed)\n", received, failures);
+        printf("elapsed (ms):   %.1f\n", elapsed);
+        printf("throughput:     %.1f pairs/s\n",
+               elapsed > 0 ? received * 1000.0 / elapsed : 0.0);
+
+        cs_pipeline_destroy(pipe);
+        free(left); free(right);
+        return failures ? 1 : 0;
+    }
+
     cs_context *ctx = cs_init(&cfg);
     if (!ctx) {
         fprintf(stderr, "cs_init failed\n");
         free(left); free(right);
         return 1;
     }
-
-    cs_frame lf = {0}, rf = {0};
-    lf.data[0] = left; lf.stride[0] = w; lf.width = w; lf.height = h; lf.fmt = CS_PIX_FMT_GRAY8;
-    rf.data[0] = right; rf.stride[0] = w; rf.width = w; rf.height = h; rf.fmt = CS_PIX_FMT_GRAY8;
 
     double *extract_ms = (double *)malloc((size_t)iters * sizeof(double));
     double *convert_ms = (double *)malloc((size_t)iters * sizeof(double));
