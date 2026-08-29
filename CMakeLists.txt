@@ -22,6 +22,9 @@ target_include_directories(codec_stereo
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+if(UNIX)
+    target_link_libraries(codec_stereo PUBLIC m)
+endif()
 
 if(CS_ENABLE_REF_SAD)
     target_sources(codec_stereo PRIVATE src/backends/cs_backend_ref_sad.c)
@@ -73,6 +76,10 @@ if(CS_BUILD_TESTS)
     add_executable(test_calibration tests/test_calibration.c)
     target_link_libraries(test_calibration PRIVATE codec_stereo)
     add_test(NAME calibration COMMAND test_calibration)
+
+    add_executable(test_upsample_crosscheck tests/test_upsample_crosscheck.c)
+    target_link_libraries(test_upsample_crosscheck PRIVATE codec_stereo)
+    add_test(NAME upsample_crosscheck COMMAND test_upsample_crosscheck)
 endif()
 
 if(CS_BUILD_HARNESS)

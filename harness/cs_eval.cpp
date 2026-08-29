@@ -241,6 +241,7 @@ int main(int argc, char **argv) {
     int block_w = 16, block_h = 16;
     int search_margin = 8;
     std::string lavc_me = "umh"; /* esa is O(merange^2); intractable at ndisp~270 */
+    int lavc_qp = -1; /* -1 = use lavc_sw's own default (qp=10) */
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -249,6 +250,7 @@ int main(int argc, char **argv) {
         else if (a == "--block" && i + 2 < argc) { block_w = atoi(argv[++i]); block_h = atoi(argv[++i]); }
         else if (a == "--search-margin" && i + 1 < argc) search_margin = atoi(argv[++i]);
         else if (a == "--lavc-me" && i + 1 < argc) lavc_me = argv[++i];
+        else if (a == "--lavc-qp" && i + 1 < argc) lavc_qp = atoi(argv[++i]);
         else { std::fprintf(stderr, "unrecognized argument: %s\n", a.c_str()); return 2; }
     }
 
@@ -303,6 +305,7 @@ int main(int argc, char **argv) {
     int ref_sad_rc = run_backend("ref_sad", nullptr, lf, rf, block_w, block_h, search_x, search_y,
                                   disp_offset, gt_blocks, cols, rows, &ref_sad_m);
     std::string lavc_params = "me=" + lavc_me;
+    if (lavc_qp >= 0) lavc_params += ";qp=" + std::to_string(lavc_qp);
     int lavc_sw_rc = run_backend("lavc_sw", lavc_params.c_str(), lf, rf, block_w, block_h, search_x, search_y,
                                   disp_offset, gt_blocks, cols, rows, &lavc_sw_m);
 

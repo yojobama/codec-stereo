@@ -122,6 +122,53 @@ void cs_disparity_to_depth(const float *disparity_in, size_t n,
                             float *depth_out);
 
 /* ------------------------------------------------------------------ */
+/* Opt-in extras (Design Sec. 8: off by default, added cost)           */
+/* ------------------------------------------------------------------ */
+
+typedef enum cs_upsample_mode {
+    CS_UPSAMPLE_NEAREST = 0,
+    CS_UPSAMPLE_BILINEAR
+} cs_upsample_mode;
+
+/*
+ * Upsamples a (cols x rows) block-grid disparity map to a full
+ * (out_w x out_h) per-pixel map (block_w*cols and block_h*rows need not
+ * exactly equal out_w/out_h; edge blocks are clamped). CS_DISPARITY_INVALID
+ * cells never contribute to a bilinear blend -- a pixel blending toward an
+ * invalid neighbor falls back to its nearest valid cell.
+ *
+ * This is a caller-invoked convenience, not something any backend does
+ * internally -- upsampling is off by default (Design Sec. 7), since it is
+ * added cost the library is otherwise explicitly trying to avoid.
+ */
+void cs_disparity_upsample(const float *disparity_grid, int cols, int rows,
+                            int block_w, int block_h,
+                            cs_upsample_mode mode,
+                            float *pixel_out, int out_w, int out_h);
+
+/*
+ * Cross-checks a forward (left-anchored) disparity map against a backward
+ * one (computed by extracting with left/right swapped -- see Design Sec. 8's
+ * "R->L, cross-check" opt-in mode). Both maps must be on the same
+ * (cols x rows) grid with the same block_w and the same disparity sign
+ * convention (the caller is responsible for negating the backward pass's
+ * output first if its backend/argument order gives the opposite sign --
+ * see cs_mv_field's sign-convention note); a consistent pair satisfies
+ * forward[bx] + backward[bx shifted by forward[bx]] == 0.
+ *
+ * For each forward cell at column bx, this searches backward columns
+ * within +/-search_px (converted to a block-column range via block_w) of
+ * the forward-shifted position bx*block_w + forward[bx], and invalidates
+ * the forward cell in `out` unless some candidate backward cell agrees
+ * (|forward[bx] + backward[candidate]| <= max_diff). Either side already
+ * invalid also invalidates. `out` may alias `forward`.
+ */
+void cs_disparity_cross_check(const float *forward, const float *backward,
+                               int cols, int rows, int block_w,
+                               float max_diff, int search_px,
+                               float *out);
+
+/* ------------------------------------------------------------------ */
 /* Backend abstraction                                                 */
 /* ------------------------------------------------------------------ */
 

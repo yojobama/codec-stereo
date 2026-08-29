@@ -107,8 +107,20 @@ static int lavc_sw_init(void *vctx, const cs_config *cfg) {
 
     ctx->subpel_enabled = cfg->subpel;
     ctx->disparity_offset = cfg->disparity_offset;
-    ctx->qp = 10; /* low QP shrinks the MV-cost/lambda term vs SAD, reducing
-                     the predictor smoothing bias -- see Docs Sec. "Phase 1" */
+    /*
+     * Chosen from a QP sweep {0,5,10,18,26} against Middlebury
+     * Motorcycle-perfect (harness/cs_eval.cpp --lavc-qp): RMSE was
+     * essentially flat across 5-26 (32.2-32.7) at ~50-54% density -- the
+     * "lower QP -> less RD/predictor bias -> better accuracy" hypothesis
+     * this project started with barely held in practice. QP=0 did get a
+     * meaningfully better RMSE (31.0) but density collapsed to 12%: at
+     * near-zero lambda the encoder's mode decision stopped favoring
+     * inter-coding at all for most blocks, so the "improvement" is over a
+     * much smaller, easier subset, not a real win. 10 sits in the flat
+     * part of the curve with normal density; nothing in this sweep
+     * justifies moving it.
+     */
+    ctx->qp = 10;
     strncpy(ctx->me, "esa", sizeof ctx->me - 1); /* exhaustive; O(merange^2),
         override to umh/hex/dia via backend_params for large merange */
 

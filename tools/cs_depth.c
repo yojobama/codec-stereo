@@ -5,6 +5,12 @@
  *   cs_depth LEFT.pgm RIGHT.pgm OUT.pfm
  *            [--backend NAME] [--block W H] [--search SX SY]
  *            [--offset D] [--min-disparity D]
+ *            [--cross-check] [--upsample nearest|bilinear]
+ *
+ * --cross-check and --upsample are the opt-in extras from
+ * Docs/codec-stereo-DESIGN.md Sec. 8 -- both off by default, both added
+ * cost: cross-check runs a second R->L extraction (~2x latency) and
+ * upsample expands the block-granular output to per-pixel resolution.
  */
 
 #include "codec_stereo/cs.h"
@@ -17,7 +23,8 @@
 static void usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s LEFT.pgm RIGHT.pgm OUT.pfm [--backend NAME] "
-        "[--block W H] [--search SX SY] [--offset D] [--min-disparity D]\n",
+        "[--block W H] [--search SX SY] [--offset D] [--min-disparity D] "
+        "[--cross-check] [--upsample nearest|bilinear]\n",
         argv0);
 }
 
@@ -30,6 +37,9 @@ int main(int argc, char **argv) {
 
     cs_config cfg = {0};
     float min_disparity = 0.5f;
+    int do_cross_check = 0;
+    int do_upsample = 0;
+    cs_upsample_mode upsample_mode = CS_UPSAMPLE_NEAREST;
 
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
@@ -44,6 +54,14 @@ int main(int argc, char **argv) {
             cfg.disparity_offset = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--min-disparity") == 0 && i + 1 < argc) {
             min_disparity = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--cross-check") == 0) {
+            do_cross_check = 1;
+        } else if (strcmp(argv[i], "--upsample") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "nearest") == 0) upsample_mode = CS_UPSAMPLE_NEAREST;
+            else if (strcmp(mode, "bilinear") == 0) upsample_mode = CS_UPSAMPLE_BILINEAR;
+            else { fprintf(stderr, "--upsample expects nearest or bilinear\n"); return 2; }
+            do_upsample = 1;
         } else {
             fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
             usage(argv[0]);
@@ -105,17 +123,99 @@ int main(int argc, char **argv) {
     dcfg.max_cost = 0;    /* 0 = no cost gate */
     cs_mv_field_to_disparity(&field, &dcfg, disp);
 
-    if (cs_pfm_write(out_path, disp, field.cols, field.rows) != 0) {
+    if (do_cross_check) {
+        /* R->L pass: swap which frame is "left"/"right" for this second
+           extraction. disparity_offset is negated -- the physical search
+           bias flips direction when the anchor/target roles swap (see
+           Docs Sec. 8's cross-check note and cs_disparity_cross_check's
+           docstring on matching sign conventions). */
+        cs_config back_cfg = cfg;
+        back_cfg.disparity_offset = -cfg.disparity_offset;
+        cs_context *back_ctx = cs_init(&back_cfg);
+        if (!back_ctx) {
+            fprintf(stderr, "cross-check: cs_init (backward pass) failed\n");
+            free(disp);
+            cs_destroy(ctx);
+            free(left); free(right);
+            return 1;
+        }
+
+        cs_mv_field back_field = {0};
+        int back_rc = cs_extract(back_ctx, &rf, &lf, &back_field); /* note: swapped */
+        if (back_rc != 0 || back_field.cols != field.cols || back_field.rows != field.rows) {
+            fprintf(stderr, "cross-check: backward extraction failed or grid mismatch\n");
+            cs_destroy(back_ctx);
+            free(disp);
+            cs_destroy(ctx);
+            free(left); free(right);
+            return 1;
+        }
+
+        float *back_disp = (float *)malloc((size_t)field.cols * field.rows * sizeof(float));
+        if (!back_disp) {
+            cs_destroy(back_ctx);
+            free(disp);
+            cs_destroy(ctx);
+            free(left); free(right);
+            return 1;
+        }
+        /*
+         * cs_mv_field_to_disparity's min_disparity gate assumes a
+         * positive-valid convention (near-zero-or-negative = invalid/at-
+         * infinity, per Design Sec. 7) -- but the backward pass's genuine,
+         * valid matches come out on the *other* side of zero from the
+         * forward pass (that's the whole point: forward+backward should
+         * sum to ~0 for a consistent pair). Reusing dcfg's min_disparity
+         * here would invalidate every real backward match. Disable that
+         * gate for this pass; cs_disparity_cross_check's own consistency
+         * check is the actual validity test for these values.
+         */
+        cs_disparity_config back_dcfg = dcfg;
+        back_dcfg.min_disparity = -1e6f;
+        cs_mv_field_to_disparity(&back_field, &back_dcfg, back_disp);
+
+        cs_disparity_cross_check(disp, back_disp, field.cols, field.rows,
+                                  field.block_w, 2.0f, field.block_w * 2, disp);
+
+        free(back_disp);
+        cs_destroy(back_ctx);
+    }
+
+    const float *to_write = disp;
+    float *upsampled = NULL;
+    int write_w = field.cols, write_h = field.rows;
+
+    if (do_upsample) {
+        upsampled = (float *)malloc((size_t)lw * lh * sizeof(float));
+        if (!upsampled) {
+            free(disp);
+            cs_destroy(ctx);
+            free(left); free(right);
+            return 1;
+        }
+        cs_disparity_upsample(disp, field.cols, field.rows, field.block_w, field.block_h,
+                               upsample_mode, upsampled, lw, lh);
+        to_write = upsampled;
+        write_w = lw;
+        write_h = lh;
+    }
+
+    if (cs_pfm_write(out_path, to_write, write_w, write_h) != 0) {
         fprintf(stderr, "failed to write %s\n", out_path);
+        free(upsampled);
         free(disp);
         cs_destroy(ctx);
         free(left); free(right);
         return 1;
     }
 
-    fprintf(stderr, "wrote %dx%d disparity (block %dx%d) to %s\n",
-            field.cols, field.rows, field.block_w, field.block_h, out_path);
+    fprintf(stderr, "wrote %dx%d disparity (block %dx%d)%s%s to %s\n",
+            write_w, write_h, field.block_w, field.block_h,
+            do_cross_check ? ", cross-checked" : "",
+            do_upsample ? ", upsampled" : "",
+            out_path);
 
+    free(upsampled);
     free(disp);
     cs_destroy(ctx);
     free(left);
