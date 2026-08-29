@@ -33,6 +33,10 @@ cs_backend_factory cs_backend_lavc_sw_factory(void);
 cs_backend_factory cs_backend_rkmpp_factory(void);
 #endif
 
+#ifdef CS_ENABLE_RKMPP_HWENC
+cs_backend_factory cs_backend_rkmpp_hwenc_factory(void);
+#endif
+
 #ifdef CS_ENABLE_D3D12
 cs_backend_factory cs_backend_d3d12_vme_factory(void);
 #endif

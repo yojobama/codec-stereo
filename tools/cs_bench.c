@@ -58,6 +58,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--search") == 0 && i + 2 < argc) {
             cfg.search_range_x = atoi(argv[++i]);
             cfg.search_range_y = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--params") == 0 && i + 1 < argc) {
+            cfg.backend_params = argv[++i];
         } else {
             fprintf(stderr, "unrecognized argument: %s\n", argv[i]);
             return 2;

@@ -26,6 +26,9 @@ static const cs_backend_factory *cs_all_factories(size_t *count) {
 #ifdef CS_ENABLE_RKMPP
         arr[n++] = cs_backend_rkmpp_factory();
 #endif
+#ifdef CS_ENABLE_RKMPP_HWENC
+        arr[n++] = cs_backend_rkmpp_hwenc_factory();
+#endif
 #ifdef CS_ENABLE_D3D12
         arr[n++] = cs_backend_d3d12_vme_factory();
 #endif
