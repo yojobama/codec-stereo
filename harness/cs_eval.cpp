@@ -96,9 +96,15 @@ static void aggregate_to_blocks(const float *pixels, int w, int h,
     }
 }
 
+static CalibInfo g_calib; /* set in main(); used for depth-error reporting */
+
 struct Metrics {
     double bad1 = 0, bad2 = 0, bad4 = 0;
     double rmse = 0, mae = 0;
+    double med = 0, p90 = 0;                /* disparity |error|, pixels */
+    double depth_mean_mm = 0, depth_med_mm = 0; /* |Z_pred - Z_gt|, blocks with both disparities > 0 */
+    double depth_rel_med = 0;               /* median |Z_pred - Z_gt| / Z_gt, percent */
+    int n_depth = 0;
     double density = 0; /* valid predictions / valid ground truth */
     int n_valid_gt = 0, n_evaluated = 0;
 };
@@ -107,12 +113,21 @@ static Metrics compute_metrics(const std::vector<float> &pred, const std::vector
     Metrics m;
     double se = 0, ae = 0;
     int n_valid_pred = 0;
+    std::vector<double> errs, derrs, drel;
+    const double zk = (double)g_calib.fx * (double)g_calib.baseline; /* Z[mm] = fx*B/(d+doffs) */
     for (size_t i = 0; i < gt.size(); i++) {
         if (gt[i] == CS_DISPARITY_INVALID) continue;
         m.n_valid_gt++;
         if (pred[i] == CS_DISPARITY_INVALID) continue;
         n_valid_pred++;
         double err = std::fabs((double)pred[i] - (double)gt[i]);
+        errs.push_back(err);
+        if (pred[i] > 0.0f && gt[i] > 0.0f && zk > 0.0) {
+            double zp = zk / ((double)pred[i] + g_calib.doffs);
+            double zg = zk / ((double)gt[i] + g_calib.doffs);
+            derrs.push_back(std::fabs(zp - zg));
+            drel.push_back(100.0 * std::fabs(zp - zg) / zg);
+        }
         se += err * err;
         ae += err;
         if (err > 1.0) m.bad1++;
@@ -126,6 +141,25 @@ static Metrics compute_metrics(const std::vector<float> &pred, const std::vector
         m.bad1 = 100.0 * m.bad1 / m.n_evaluated;
         m.bad2 = 100.0 * m.bad2 / m.n_evaluated;
         m.bad4 = 100.0 * m.bad4 / m.n_evaluated;
+        auto pct = [](std::vector<double> &v, double p) {
+            size_t k = (size_t)(p * (double)(v.size() - 1));
+            std::nth_element(v.begin(), v.begin() + (long)k, v.end());
+            return v[k];
+        };
+        m.med = pct(errs, 0.5);
+        m.p90 = pct(errs, 0.9);
+    }
+    if (!derrs.empty()) {
+        double s = 0;
+        for (double d : derrs) s += d;
+        m.depth_mean_mm = s / (double)derrs.size();
+        std::vector<double> &d = derrs;
+        size_t k = d.size() / 2;
+        std::nth_element(d.begin(), d.begin() + (long)k, d.end());
+        m.depth_med_mm = d[k];
+        std::nth_element(drel.begin(), drel.begin() + (long)k, drel.end());
+        m.depth_rel_med = drel[k];
+        m.n_depth = (int)derrs.size();
     }
     m.density = m.n_valid_gt > 0 ? (double)n_valid_pred / m.n_valid_gt : 0.0;
     return m;
@@ -136,6 +170,9 @@ static void print_metrics(const char *label, const Metrics &m) {
                 "RMSE=%7.3f  MAE=%7.3f  density=%5.1f%%  (n=%d/%d)\n",
                 label, m.bad1, m.bad2, m.bad4, m.rmse, m.mae,
                 100.0 * m.density, m.n_evaluated, m.n_valid_gt);
+    std::printf("%-16s  disparity err [px]: mean=%6.2f median=%6.2f p90=%7.2f | "
+                "depth err [mm]: mean=%8.1f median=%7.1f (median %.2f%% of true depth)\n",
+                "", m.mae, m.med, m.p90, m.depth_mean_mm, m.depth_med_mm, m.depth_rel_med);
 }
 
 /* Sparsification AUC: sort blocks with valid pred+gt+cost by ascending
@@ -297,6 +334,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    g_calib = calib;
     const int w = left.cols, h = left.rows;
     const int cols = (w + block_w - 1) / block_w;
     const int rows = (h + block_h - 1) / block_h;

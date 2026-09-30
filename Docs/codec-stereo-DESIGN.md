@@ -805,3 +805,24 @@ block-avg 31.48%). Motorcycle-perfect, 16x16 blocks, full resolution
 QSV scales near-linearly to 2-3 workers and saturates around 4 at 640x480
 (the iGPU's encode engine, plus decode threads competing for 8 logical cores)
 and ~6-8 at 1080p; at 1080p it sustains ~4.8x `lavc_sw`'s best throughput.
+
+### 13b. Median and depth error (2026-09-30)
+
+`cs_eval` now also reports, per backend, the disparity error's mean / median /
+p90 (px) and the depth error in mm (Z = fx*baseline/(d+doffs), blocks where
+both disparities are > 0). Motorcycle, 16x16 blocks:
+
+| Backend | density | disp mean | median | p90 (px) | depth mean | median (mm) | median % |
+|---|---|---|---|---|---|---|---|
+| `ref_sad` | 99.8% | 22.95 | 2.02 | 80.95 | 289 | 22.7 | 0.72% |
+| `lavc_sw` | 50.5% | 13.22 | 2.56 | 34.35 | 160 | 31.2 | 1.03% |
+| `qsv_hwenc` qp=12 | 20.9% | 9.79 | 2.33 | 21.69 | 126 | 29.6 | 0.95% |
+| `qsv_hwenc` qp=20 | 40.2% | 8.63 | 1.92 | 19.65 | 113 | 23.7 | 0.77% |
+| `qsv_hwenc` lowpower=1;qp=20 | 49.6% | 10.32 | 2.20 | 24.71 | 132 | 27.2 | 0.88% |
+| SGBM block-avg | 89.2% | 9.98 | 0.42 | 34.49 | 156 | 5.5 | 0.17% |
+| SGBM full-res | 82.2% | 2.61 | 0.33 | 1.32 | 36.0 | 3.5 | 0.12% |
+
+The mean is dominated by a minority of gross mismatches (mean 4-10x median).
+Each row averages only over blocks the backend answered, so low-density rows
+are judged on easier blocks. Error is vs ground truth averaged per 16x16
+block, so depth edges inside a block add error even a perfect matcher keeps.
