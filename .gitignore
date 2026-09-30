@@ -19,3 +19,5 @@ CMakeUserPresets.json
 #cmake-build-*
 build/
 data/
+/.vs/
+/.idea/
