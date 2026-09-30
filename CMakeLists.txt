@@ -156,12 +156,21 @@ if(CS_BUILD_HARNESS)
     enable_language(CXX)
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
-    find_package(PkgConfig REQUIRED)
     # find_package(OpenCV CONFIG) can pick up an unrelated locally-built
-    # OpenCV 5.x under /usr/local ahead of the system package (OpenCV 5
-    # renamed calib3d -> calib, breaking this harness's API assumptions).
-    # Go through pkg-config for the system opencv4 package explicitly.
-    pkg_check_modules(OPENCV REQUIRED IMPORTED_TARGET opencv4)
+    # OpenCV 5.x under /usr/local ahead of the system package, so prefer
+    # pkg-config for the system opencv4 package. Where pkg-config is absent
+    # (Windows), fall back to OpenCVConfig.cmake via OpenCV_DIR; the harness
+    # source handles both OpenCV 4 (calib3d.hpp) and 5 (stereo.hpp).
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(OPENCV QUIET IMPORTED_TARGET opencv4)
+    endif()
     add_executable(cs_eval harness/cs_eval.cpp)
-    target_link_libraries(cs_eval PRIVATE codec_stereo PkgConfig::OPENCV)
+    if(OPENCV_FOUND)
+        target_link_libraries(cs_eval PRIVATE codec_stereo PkgConfig::OPENCV)
+    else()
+        find_package(OpenCV CONFIG REQUIRED)
+        target_include_directories(cs_eval PRIVATE ${OpenCV_INCLUDE_DIRS})
+        target_link_libraries(cs_eval PRIVATE codec_stereo ${OpenCV_LIBS})
+    endif()
 endif()

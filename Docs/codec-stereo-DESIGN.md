@@ -757,3 +757,51 @@ Turing-or-newer / non-GP108 NVIDIA GPU. The installed driver package also keeps
 A registered backend whose `init()` fails (no device) is now `SKIP`, not
 `FAIL`; `CS_TEST_REQUIRE=name1,name2` makes chosen backends mandatory, and
 `CS_TEST_PARAMS` passes `backend_params` to the calibration test.
+
+### 13a. QSV on Middlebury Motorcycle, and multi-worker throughput (2026-09-30)
+
+`harness/cs_eval` now takes `--backend NAME[:PARAMS]` (repeatable) and
+`--no-sgbm`, and builds against OpenCV 4 (pkg-config) or 5 (`OpenCV_DIR`;
+`StereoSGBM` moved to `opencv2/stereo.hpp`). Baseline run reproduces the
+Section 9 table exactly (ref_sad 50.14% bad-2.0, lavc_sw 55.85%, SGBM
+block-avg 31.48%). Motorcycle-perfect, 16x16 blocks, full resolution
+2964x2000, MSVC Release, Iris Plus:
+
+| Backend / params | bad-2.0 | bad-4.0 | RMSE | density |
+|---|---|---|---|---|
+| `ref_sad` | 50.14% | 42.70% | 47.60 | 99.8% |
+| `lavc_sw` (umh, qp 10) | 55.85% | 40.58% | 32.43 | 50.5% |
+| `qsv_hwenc` qp=12 (old default) | 53.99% | 36.41% | 24.29 | 20.9% |
+| **`qsv_hwenc` qp=20 (new default)** | **49.03%** | **32.39%** | **22.35** | 40.2% |
+| `qsv_hwenc` qp=30 | 57.51% | 38.51% | 23.92 | 57.5% |
+| `qsv_hwenc` qp=40 | 70.86% | 54.62% | 29.39 | 65.5% |
+| `qsv_hwenc` lowpower=1 | 51.84% | 35.68% | 25.21 | 41.5% |
+| `qsv_hwenc` lowpower=1;qp=20 | 52.42% | 36.64% | 25.44 | 49.6% |
+| `qsv_hwenc` tu=1 | 54.50% | 37.87% | 25.25 | 21.8% |
+
+- Density is the weak point: at qp 10-12 the encoder codes ~80% of blocks
+  intra (no vector). A higher QP makes inter cheaper and raises density, but
+  accuracy falls off past ~qp 25. qp=20 is the best measured trade-off and is
+  the new default. Its bad-2.0/bad-4.0/RMSE beat `lavc_sw` while density is
+  lower (40% vs 50%), so the per-block rates are over different block sets
+  and are not strictly like-for-like.
+- `cabac=1` and `lowpower=2` reproduce the default's metrics exactly
+  (entropy coding does not change motion search; the default is already the
+  non-low-power path). Keep CAVLC: CABAC is 2.3x slower (40.5 vs 17.4 ms).
+- `qp=20` latency at 1080p: 16.6 ms (vs 17.3 ms at qp=12).
+- SGBM block-avg remains clearly better (31.48% bad-2.0, 89% density); no
+  block-matching backend here closes that gap.
+
+`cs_bench --workers N`, 200 pairs, synthetic noise, i7-1065G7 (4c/8t), pairs/s,
+0 failures in every run checked:
+
+| Backend, size | 1 | 2 | 3 | 4 | 6 | 8 |
+|---|---|---|---|---|---|---|
+| `qsv_hwenc` 640x480 | 179 | 330 | 421 | **444** | 427 | 397 |
+| `lavc_sw` 640x480 | 55 | 104 | 147 | 180 | 208 | 229 |
+| `qsv_hwenc` 1080p | 54 | 104 | 146 | 169 | 178 | **181** |
+| `lavc_sw` 1080p | 11.7 | 21.7 | 29.6 | 30.0 | 34.9 | 37.5 |
+
+QSV scales near-linearly to 2-3 workers and saturates around 4 at 640x480
+(the iGPU's encode engine, plus decode threads competing for 8 logical cores)
+and ~6-8 at 1080p; at 1080p it sustains ~4.8x `lavc_sw`'s best throughput.

@@ -26,7 +26,11 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#if __has_include(<opencv2/stereo.hpp>)
+#include <opencv2/stereo.hpp> /* OpenCV 5 moved StereoSGBM here */
+#else
 #include <opencv2/calib3d.hpp>
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -242,6 +246,11 @@ int main(int argc, char **argv) {
     int search_margin = 8;
     std::string lavc_me = "umh"; /* esa is O(merange^2); intractable at ndisp~270 */
     int lavc_qp = -1; /* -1 = use lavc_sw's own default (qp=10) */
+    bool run_sgbm = true;
+    /* --backend NAME[:PARAMS] (repeatable; PARAMS is the backend_params
+       string, e.g. qsv_hwenc:lowpower=1;qp=30). With none given, runs the
+       original ref_sad + lavc_sw pair. */
+    std::vector<std::pair<std::string, std::string>> extra_backends;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -251,6 +260,13 @@ int main(int argc, char **argv) {
         else if (a == "--search-margin" && i + 1 < argc) search_margin = atoi(argv[++i]);
         else if (a == "--lavc-me" && i + 1 < argc) lavc_me = argv[++i];
         else if (a == "--lavc-qp" && i + 1 < argc) lavc_qp = atoi(argv[++i]);
+        else if (a == "--no-sgbm") run_sgbm = false;
+        else if (a == "--backend" && i + 1 < argc) {
+            std::string spec = argv[++i];
+            size_t c = spec.find(':');
+            extra_backends.emplace_back(spec.substr(0, c),
+                                        c == std::string::npos ? "" : spec.substr(c + 1));
+        }
         else { std::fprintf(stderr, "unrecognized argument: %s\n", a.c_str()); return 2; }
     }
 
@@ -301,19 +317,31 @@ int main(int argc, char **argv) {
     rf.data[0] = right.data; rf.stride[0] = (int)right.step; rf.width = w; rf.height = h; rf.fmt = CS_PIX_FMT_GRAY8;
 
     std::printf("--- block-grid comparison (%dx%d blocks) ---\n", cols, rows);
-    Metrics ref_sad_m, lavc_sw_m;
-    int ref_sad_rc = run_backend("ref_sad", nullptr, lf, rf, block_w, block_h, search_x, search_y,
-                                  disp_offset, gt_blocks, cols, rows, &ref_sad_m);
-    std::string lavc_params = "me=" + lavc_me;
-    if (lavc_qp >= 0) lavc_params += ";qp=" + std::to_string(lavc_qp);
-    int lavc_sw_rc = run_backend("lavc_sw", lavc_params.c_str(), lf, rf, block_w, block_h, search_x, search_y,
-                                  disp_offset, gt_blocks, cols, rows, &lavc_sw_m);
+    if (extra_backends.empty()) {
+        Metrics ref_sad_m, lavc_sw_m;
+        int ref_sad_rc = run_backend("ref_sad", nullptr, lf, rf, block_w, block_h, search_x, search_y,
+                                      disp_offset, gt_blocks, cols, rows, &ref_sad_m);
+        std::string lavc_params = "me=" + lavc_me;
+        if (lavc_qp >= 0) lavc_params += ";qp=" + std::to_string(lavc_qp);
+        int lavc_sw_rc = run_backend("lavc_sw", lavc_params.c_str(), lf, rf, block_w, block_h, search_x, search_y,
+                                      disp_offset, gt_blocks, cols, rows, &lavc_sw_m);
 
-    if (ref_sad_rc == 0 && lavc_sw_rc == 0 && ref_sad_m.rmse > 0.0) {
-        std::printf("\nlavc_sw RMSE / ref_sad RMSE = %.3f  "
-                    "(headline cost of the encoder's RD/predictor bias vs. block granularity alone)\n",
-                    lavc_sw_m.rmse / ref_sad_m.rmse);
+        if (ref_sad_rc == 0 && lavc_sw_rc == 0 && ref_sad_m.rmse > 0.0) {
+            std::printf("\nlavc_sw RMSE / ref_sad RMSE = %.3f  "
+                        "(headline cost of the encoder's RD/predictor bias vs. block granularity alone)\n",
+                        lavc_sw_m.rmse / ref_sad_m.rmse);
+        }
+    } else {
+        for (const auto &b : extra_backends) {
+            /* label carries the params so a tuning sweep stays readable */
+            std::string label = b.second.empty() ? b.first : b.first + "[" + b.second + "]";
+            std::printf("%s\n", label.c_str());
+            run_backend(b.first.c_str(), b.second.empty() ? nullptr : b.second.c_str(), lf, rf,
+                         block_w, block_h, search_x, search_y, disp_offset, gt_blocks, cols, rows);
+        }
     }
+
+    if (!run_sgbm) { free(gt_pixels); return 0; }
 
     /* SGBM baseline, aggregated to the same block grid for a fair comparison,
        and reported natively (full pixel resolution) for context. */

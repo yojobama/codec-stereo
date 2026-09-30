@@ -12,7 +12,7 @@
  *
  * Status: not yet measured on hardware -- see Docs/codec-stereo-DESIGN.md.
  *
- * backend_params keys: qp=N (default 12), tu=1..7 (target usage, 1 = best
+ * backend_params keys: qp=N (default 20, see design doc Sec. 13), tu=1..7 (target usage, 1 = best
  * quality, 7 = fastest, default 7), cabac=0|1 (default 0), lowpower=0|1|2
  * (0 = driver default, 1 = on, 2 = off), slices=N (decoder slice threads).
  * Env: CS_QSV_DEBUG (print oneVPL errors), CS_QSV_TIMING (phase timing).
@@ -111,7 +111,7 @@ static int qsv_hwenc_init(void *vctx, const cs_config *cfg) {
     ctx->block_w = cfg->block_w > 0 ? cfg->block_w : 16;
     ctx->block_h = cfg->block_h > 0 ? cfg->block_h : 16;
     ctx->disparity_offset = cfg->disparity_offset;
-    ctx->qp = 12;
+    ctx->qp = 20; /* Middlebury sweep: best accuracy of qp 10..40 */
     ctx->tu = 7;
     ctx->cabac = 0;
     ctx->lowpower = 0;
