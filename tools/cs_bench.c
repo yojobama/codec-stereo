@@ -10,6 +10,7 @@
  */
 
 #include "codec_stereo/cs.h"
+#include "codec_stereo/cs_clock.h"
 #include "codec_stereo/cs_pipeline.h"
 #include "codec_stereo/cs_util.h"
 
@@ -23,11 +24,7 @@ static int cmp_double(const void *a, const void *b) {
     return (da > db) - (da < db);
 }
 
-static double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
-}
+#define now_ms cs_now_ms
 
 static void fill_textured(uint8_t *buf, int n) {
     uint32_t state = 0x9e3779b9u;

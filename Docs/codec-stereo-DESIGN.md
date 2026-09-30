@@ -707,3 +707,53 @@ back up:
   H.264 analogy, not verified against real hardware.
 - **Not attempted**: `nvenc`, `vaapi_fei`, `videotoolbox` — no matching
   hardware was available to test against.
+
+## 13. Windows bring-up: `qsv_hwenc` and `nvenc_hwenc` (2026-09-30)
+
+Both are `CS_MODE_ENCODE_DECODE` backends built on the same recipe as
+`rkmpp_hwenc`: hardware H.264 encode of the pair as I+P, then the shared
+software decode half (`src/backends/cs_h264_mvdec.{c,h}`: stand-in flat-gray
+IDR, skipped IDCT/deblock, MV export). `rkmpp_hwenc` was refactored onto that
+shared half; that refactor could not be compiled on the Windows machine (no MPP
+headers) and still needs a run on the RK3588.
+
+Build: `CMakePresets.json` (`msvc`, `mingw`, `*-vcpkg`) + `vcpkg.json`. Both
+MSVC (VS 18) and MinGW-w64 (gcc 15, vcpkg triplet `x64-mingw-dynamic`) build
+warning-free and pass all three ctest tests. `ffnvcodec` is pinned to 12.2.72.0
+(newer headers fail against drivers that only speak NVENC API 12.2). x264 is an
+opt-in GPL vcpkg feature (`-DVCPKG_MANIFEST_FEATURES=lavc-x264`) used only by
+the `lavc_sw` reference.
+
+### Intel QSV (oneVPL) — Iris Plus, driver 31.0.101.2115
+- `test_calibration`: PASS on both toolchains, also with `lowpower=1|2`,
+  `qp=30|45`, `tu=1`, `cabac=1`. That test is an easy exact-shift synthetic
+  pair; **Middlebury accuracy has not been measured yet** (the harness is
+  hard-wired to `lavc_sw`/`ref_sad` and needs OpenCV 4).
+- Latency, MSVC Release, synthetic noise pair, median of 40 (ms):
+
+| Size | `lavc_sw` | `qsv_hwenc` | Speedup |
+|---|---|---|---|
+| 640x480 | 18.8 | 5.1 | 3.7x |
+| 1920x1080 | 85.4 | 17.6 | 4.8x |
+| 3840x2160 | 312.4 | 55.1 | 5.7x |
+
+  1080p split: fill 0.6, hardware encode ~11.7, software decode ~4.9.
+  First call is 75-155 ms (session setup); later calls reuse the session.
+- Tuning at 1080p (default = `tu=7`, CAVLC, `qp=12`, 17.4 ms): `lowpower=1`
+  16.3; `qp=30` 16.9; `qp=30;lowpower=1` 13.8; `tu=1` 19.5; `lowpower=2`
+  17.9; **`cabac=1` 40.5** (same conclusion as rkmpp: keep CAVLC).
+  The faster settings are only validated by the calibration test so far.
+
+### NVIDIA NVENC — MX230 cannot test it
+The backend compiles, loads `nvEncodeAPI64.dll`/`nvcuda.dll` at runtime, and
+skips cleanly, but `nvEncOpenEncodeSessionEx` returns
+`NV_ENC_ERR_UNSUPPORTED_DEVICE` on the MX230 (Pascal GP108; `nvidia-smi` shows
+`Encoder: N/A`), so it very likely has no NVENC block. **`nvenc_hwenc` has
+never encoded a frame**: everything past session open is unverified and needs a
+Turing-or-newer / non-GP108 NVIDIA GPU. The installed driver package also keeps
+`nvencodeapi64.dll` only in its DriverStore folder, not in System32.
+
+### Test-suite changes
+A registered backend whose `init()` fails (no device) is now `SKIP`, not
+`FAIL`; `CS_TEST_REQUIRE=name1,name2` makes chosen backends mandatory, and
+`CS_TEST_PARAMS` passes `backend_params` to the calibration test.

@@ -37,6 +37,14 @@ cs_backend_factory cs_backend_rkmpp_factory(void);
 cs_backend_factory cs_backend_rkmpp_hwenc_factory(void);
 #endif
 
+#ifdef CS_ENABLE_NVENC
+cs_backend_factory cs_backend_nvenc_hwenc_factory(void);
+#endif
+
+#ifdef CS_ENABLE_QSV
+cs_backend_factory cs_backend_qsv_hwenc_factory(void);
+#endif
+
 #ifdef CS_ENABLE_D3D12
 cs_backend_factory cs_backend_d3d12_vme_factory(void);
 #endif

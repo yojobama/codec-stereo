@@ -33,40 +33,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <time.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include "codec_stereo/cs_clock.h"
 
 /* Set CS_LAVC_SW_TIMING to any value for a phase breakdown to stderr:
    encode setup, HW... er, SW encode (per frame), decoder setup, SW decode
    (per packet) -- same diagnostic pattern as cs_backend_rkmpp_hwenc.c,
    added to check whether that backend's CAVLC-decodes-faster-than-CABAC
-   finding transfers here (it didn't -- see below for why).
-
-   LUMEN LOCAL PATCH (not upstreamed, not committed to this submodule):
-   clock_gettime(CLOCK_MONOTONIC, ...) has no MSVC declaration -- branch on
-   QueryPerformanceCounter for a monotonic clock on Windows instead of
-   silently dropping to a non-monotonic wall clock. */
-#ifdef _WIN32
-static double now_ms(void) {
-    static LARGE_INTEGER freq;
-    static int have_freq = 0;
-    LARGE_INTEGER counter;
-    if (!have_freq) {
-        QueryPerformanceFrequency(&freq);
-        have_freq = 1;
-    }
-    QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
-}
-#else
-static double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
-}
-#endif
+   finding transfers here (it didn't -- see below for why). */
+#define now_ms cs_now_ms
 
 typedef struct lavc_sw_ctx {
     int block_w, block_h;

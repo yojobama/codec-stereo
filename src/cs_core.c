@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CS_MAX_BACKENDS 8
+#define CS_MAX_BACKENDS 16
 
 struct cs_context {
     void *backend_ctx;
@@ -28,6 +28,12 @@ static const cs_backend_factory *cs_all_factories(size_t *count) {
 #endif
 #ifdef CS_ENABLE_RKMPP_HWENC
         arr[n++] = cs_backend_rkmpp_hwenc_factory();
+#endif
+#ifdef CS_ENABLE_NVENC
+        arr[n++] = cs_backend_nvenc_hwenc_factory();
+#endif
+#ifdef CS_ENABLE_QSV
+        arr[n++] = cs_backend_qsv_hwenc_factory();
 #endif
 #ifdef CS_ENABLE_D3D12
         arr[n++] = cs_backend_d3d12_vme_factory();

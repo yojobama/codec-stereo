@@ -1,0 +1,29 @@
+{
+  "name": "codec-stereo",
+  "version-string": "0.1.0",
+  "builtin-baseline": "4cb050be2cfa7a947cdd2dd1a70e24b17774c979",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [ "avcodec" ]
+    },
+    "ffnvcodec",
+    "libvpl"
+  ],
+  "overrides": [
+    { "name": "ffnvcodec", "version": "12.2.72.0" }
+  ],
+  "features": {
+    "lavc-x264": {
+      "description": "libx264 (GPL) for the lavc_sw software reference backend; enable with -DVCPKG_MANIFEST_FEATURES=lavc-x264",
+      "dependencies": [
+        {
+          "name": "ffmpeg",
+          "default-features": false,
+          "features": [ "avcodec", "x264", "gpl" ]
+        }
+      ]
+    }
+  }
+}

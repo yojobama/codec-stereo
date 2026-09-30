@@ -1,0 +1,51 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/${presetName}"
+    },
+    {
+      "name": "msvc",
+      "displayName": "MSVC (run from a VS developer prompt)",
+      "inherits": "base",
+      "architecture": { "value": "x64", "strategy": "external" },
+      "cacheVariables": { "CMAKE_C_COMPILER": "cl", "CMAKE_CXX_COMPILER": "cl" }
+    },
+    {
+      "name": "mingw",
+      "displayName": "MinGW-w64 (gcc/g++ and ninja must be on PATH)",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++" }
+    },
+    {
+      "name": "msvc-vcpkg",
+      "displayName": "MSVC + vcpkg manifest (VCPKG_ROOT must be set)",
+      "inherits": "msvc",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": { "VCPKG_TARGET_TRIPLET": "x64-windows" }
+    },
+    {
+      "name": "mingw-vcpkg",
+      "displayName": "MinGW-w64 + vcpkg manifest (VCPKG_ROOT must be set)",
+      "inherits": "mingw",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": { "VCPKG_TARGET_TRIPLET": "x64-mingw-dynamic" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "msvc", "configurePreset": "msvc" },
+    { "name": "mingw", "configurePreset": "mingw" },
+    { "name": "msvc-vcpkg", "configurePreset": "msvc-vcpkg" },
+    { "name": "mingw-vcpkg", "configurePreset": "mingw-vcpkg" }
+  ],
+  "testPresets": [
+    { "name": "msvc", "configurePreset": "msvc", "output": { "outputOnFailure": true } },
+    { "name": "mingw", "configurePreset": "mingw", "output": { "outputOnFailure": true } },
+    { "name": "msvc-vcpkg", "configurePreset": "msvc-vcpkg", "output": { "outputOnFailure": true } },
+    { "name": "mingw-vcpkg", "configurePreset": "mingw-vcpkg", "output": { "outputOnFailure": true } }
+  ]
+}

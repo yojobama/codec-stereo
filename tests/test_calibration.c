@@ -82,13 +82,29 @@ static int run_backend(const char *name) {
     cfg.subpel = 0;
     cfg.disparity_offset = 0;
     cfg.backend_override = name;
+    cfg.backend_params = getenv("CS_TEST_PARAMS"); /* e.g. "lowpower=1;qp=30" */
 
     int failed = 0;
     cs_context *ctx = cs_init(&cfg);
     if (!ctx) {
-        printf("[%-10s] FAIL: cs_init returned NULL\n", name);
+        /* init() is the capability probe: a hardware backend that is built in
+           but has no usable device on this machine is skipped, not failed.
+           CS_TEST_REQUIRE=name1,name2 turns the skip into a failure for the
+           backends the machine is expected to have. */
+        const char *req = getenv("CS_TEST_REQUIRE");
+        int required = 0;
+        if (req) {
+            size_t n = strlen(name);
+            for (const char *p = req; (p = strstr(p, name)) != NULL; p += n) {
+                int start_ok = (p == req) || p[-1] == ',';
+                int end_ok = p[n] == '\0' || p[n] == ',';
+                if (start_ok && end_ok) { required = 1; break; }
+            }
+        }
+        if (required) printf("[%-10s] FAIL: cs_init returned NULL (required)\n", name);
+        else printf("[%-10s] SKIP: cs_init returned NULL (no usable device)\n", name);
         free(left); free(right);
-        return 1;
+        return required;
     }
 
     /*

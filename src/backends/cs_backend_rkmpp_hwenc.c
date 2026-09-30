@@ -56,25 +56,19 @@
 #include <rockchip/rk_venc_cfg.h>
 #include <rockchip/rk_venc_cmd.h>
 
-#include <libavcodec/avcodec.h>
-#include <libavutil/mem.h>
-#include <libavutil/motion_vector.h>
+#include "cs_h264_mvdec.h"
+#include "codec_stereo/cs_clock.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /* Set CS_RKMPP_HWENC_TIMING to any value to print a phase-by-phase
    breakdown to stderr: MPP setup, HW encode, MPP teardown, decoder open,
    and SW decode (per packet) -- see cs_bench's own median-of-N harness for
    whole-call timing; this is for finding out *where* the time goes inside
    one call. */
-static double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
-}
+#define now_ms cs_now_ms
 
 #define RK_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
@@ -147,12 +141,13 @@ typedef struct rkmpp_hwenc_ctx {
     MppApi *mpi;
     MppBufferGroup buf_grp;
     MppBuffer frm_buf_l, frm_buf_r, pkt_buf_l, pkt_buf_r;
-    AVCodecContext *dec_ctx;
+    cs_h264_mvdec *dec;
 
     /*
-     * Stand-in IDR: a single throwaway flat-gray frame, encoded once at
-     * setup with this same encoder/SPS/PPS, and fed to the DECODER in
-     * place of the real I-frame on every call.
+     * Stand-in IDR (stored inside `dec`, see cs_h264_mvdec.h): a single
+     * throwaway flat-gray frame, encoded once at setup with this same
+     * encoder/SPS/PPS, and fed to the DECODER in place of the real I-frame
+     * on every call.
      *
      * Why this works: motion vectors are parsed syntax elements. A
      * reference frame's pixels are needed only to reconstruct the
@@ -170,9 +165,6 @@ typedef struct rkmpp_hwenc_ctx {
      * decode_slice_header -- it needs *a* reference present to substitute,
      * it just doesn't care whether the pixels are meaningful.
      */
-    uint8_t *stub_idr;
-    size_t stub_idr_len;
-
     int cols, rows;
     int16_t *dx, *dy;
     uint16_t *cost; /* always zero; this backend never reports cost */
@@ -200,7 +192,11 @@ static int rkmpp_hwenc_init(void *vctx, const cs_config *cfg) {
 
     if (mpp_check_support_format(MPP_CTX_ENC, MPP_VIDEO_CodingAVC) != MPP_OK)
         return -1;
-    if (!avcodec_find_decoder(AV_CODEC_ID_H264)) return -1;
+    {
+        cs_h264_mvdec *probe = cs_h264_mvdec_open(0, 1);
+        if (!probe) return -1;
+        cs_h264_mvdec_close(probe);
+    }
 
     ctx->block_w = cfg->block_w > 0 ? cfg->block_w : 16;
     ctx->block_h = cfg->block_h > 0 ? cfg->block_h : 16;
@@ -336,10 +332,9 @@ static int encode_collect(rkmpp_hwenc_ctx *ctx, uint8_t **out_bs, size_t *out_le
 
     void *pos = mpp_packet_get_pos(out_packet);
     size_t len = mpp_packet_get_length(out_packet);
-    uint8_t *copy = (uint8_t *)av_malloc(len + AV_INPUT_BUFFER_PADDING_SIZE);
+    uint8_t *copy = cs_h264_bs_alloc(len);
     if (!copy) { mpp_packet_deinit(&out_packet); return -1; }
     memcpy(copy, pos, len);
-    memset(copy + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
     mpp_packet_deinit(&out_packet);
 
     *out_bs = copy;
@@ -357,9 +352,8 @@ static int encode_one_frame(rkmpp_hwenc_ctx *ctx, int w, int h,
 }
 
 static void teardown_mpp_context(rkmpp_hwenc_ctx *ctx) {
-    av_freep(&ctx->stub_idr);
-    ctx->stub_idr_len = 0;
-    if (ctx->dec_ctx) avcodec_free_context(&ctx->dec_ctx);
+    cs_h264_mvdec_close(ctx->dec);
+    ctx->dec = NULL;
     if (ctx->frm_buf_l) { mpp_buffer_put(ctx->frm_buf_l); ctx->frm_buf_l = NULL; }
     if (ctx->frm_buf_r) { mpp_buffer_put(ctx->frm_buf_r); ctx->frm_buf_r = NULL; }
     if (ctx->pkt_buf_l) { mpp_buffer_put(ctx->pkt_buf_l); ctx->pkt_buf_l = NULL; }
@@ -449,35 +443,17 @@ static int ensure_mpp_context(rkmpp_hwenc_ctx *ctx, int w, int h) {
         if (ctx->mpi->control(ctx->mctx, MPP_ENC_SET_HEADER_MODE, &header_mode) != MPP_OK) goto done;
     }
 
-    {
-        const AVCodec *dec_codec = avcodec_find_decoder(AV_CODEC_ID_H264);
-        if (!dec_codec) goto done;
-        ctx->dec_ctx = avcodec_alloc_context3(dec_codec);
-        if (!ctx->dec_ctx) goto done;
-        ctx->dec_ctx->flags2 |= AV_CODEC_FLAG2_EXPORT_MVS;
-        if (ctx->slices > 1) {
-            /* Slice threading only: frame threading is useless here (our
-               two frames are dependent -- the P references the stand-in
-               IDR) and would add output latency. */
-            ctx->dec_ctx->thread_type = FF_THREAD_SLICE;
-            ctx->dec_ctx->thread_count = ctx->slices;
-        }
-        /*
-         * Nothing here ever looks at a decoded pixel -- only at parsed
-         * motion vectors -- so skip the two decode stages that exist
-         * purely to produce pixels. Worth ~3% (15.42 -> 14.98 ms at
-         * 1080p); modest because entropy decode, which cannot be skipped
-         * (it has to parse every coefficient just to know how many bits
-         * to consume), is the larger share. Set CS_RKMPP_HWENC_FULL_RECON
-         * to restore full reconstruction if you ever need to eyeball the
-         * decoded frames while debugging.
-         */
-        if (!getenv("CS_RKMPP_HWENC_FULL_RECON")) {
-            ctx->dec_ctx->skip_idct = AVDISCARD_ALL;
-            ctx->dec_ctx->skip_loop_filter = AVDISCARD_ALL;
-        }
-        if (avcodec_open2(ctx->dec_ctx, dec_codec, NULL) < 0) goto done;
-    }
+    /*
+     * Nothing here ever looks at a decoded pixel -- only at parsed motion
+     * vectors -- so skip the two decode stages that exist purely to produce
+     * pixels. Worth ~3% (15.42 -> 14.98 ms at 1080p); modest because entropy
+     * decode, which cannot be skipped (it has to parse every coefficient just
+     * to know how many bits to consume), is the larger share. Set
+     * CS_RKMPP_HWENC_FULL_RECON to restore full reconstruction if you ever
+     * need to eyeball the decoded frames while debugging.
+     */
+    ctx->dec = cs_h264_mvdec_open(ctx->slices, getenv("CS_RKMPP_HWENC_FULL_RECON") == NULL);
+    if (!ctx->dec) goto done;
 
     /*
      * Build the stand-in IDR (see the struct comment): frm_buf_l is still
@@ -488,9 +464,16 @@ static int ensure_mpp_context(rkmpp_hwenc_ctx *ctx, int w, int h) {
      * reference.
      */
     if (ctx->mpi->control(ctx->mctx, MPP_ENC_SET_IDR_FRAME, NULL) != MPP_OK) goto done;
-    if (encode_one_frame(ctx, w, h, hor_stride, ver_stride,
-                          ctx->frm_buf_l, ctx->pkt_buf_l,
-                          &ctx->stub_idr, &ctx->stub_idr_len) != 0) goto done;
+    {
+        uint8_t *stub = NULL;
+        size_t stub_len = 0;
+        if (encode_one_frame(ctx, w, h, hor_stride, ver_stride,
+                              ctx->frm_buf_l, ctx->pkt_buf_l,
+                              &stub, &stub_len) != 0) goto done;
+        int sr = cs_h264_mvdec_set_stub_idr(ctx->dec, stub, stub_len);
+        cs_h264_bs_free(stub);
+        if (sr != 0) goto done;
+    }
 
     ctx->cur_w = w;
     ctx->cur_h = h;
@@ -501,13 +484,6 @@ done:
     if (cfg) mpp_enc_cfg_deinit(cfg);
     if (!ok) teardown_mpp_context(ctx);
     return ok ? 0 : -1;
-}
-
-static int log2_pow2(int v, int fallback) {
-    if (v <= 0) return fallback;
-    int r = 0;
-    while ((1 << r) < v && r < 16) r++;
-    return (1 << r) == v ? r : fallback;
 }
 
 static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame *right,
@@ -531,14 +507,11 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
 
     int ret = -1;
     uint8_t *right_shifted = NULL;
-    uint8_t *bitstream_i = NULL, *bitstream_p = NULL; /* av_malloc'd, padded --
-        ownership transfers to pkt_i/pkt_p via av_packet_from_data below, so
+    uint8_t *bitstream_i = NULL, *bitstream_p = NULL; /* cs_h264_bs_alloc, padded --
+        bitstream_p is consumed by cs_h264_mvdec_extract below, so
         these are NOT freed directly in `done:` except on an early failure
         before that transfer happens */
     size_t bitstream_i_len = 0, bitstream_p_len = 0;
-
-    AVPacket *pkt_i = NULL, *pkt_p = NULL;
-    AVFrame *dec_frame = NULL;
 
     int timing = getenv("CS_RKMPP_HWENC_TIMING") != NULL;
     double t0 = timing ? now_ms() : 0;
@@ -604,7 +577,8 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
      * IDR takes its place below), so drop it here rather than carrying a
      * multi-MB buffer through the rest of the call.
      */
-    av_freep(&bitstream_i);
+    cs_h264_bs_free(bitstream_i);
+    bitstream_i = NULL;
     bitstream_i_len = 0;
 
     double t_encode_done = timing ? now_ms() : 0;
@@ -612,90 +586,25 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
     /* Done with MPP for this call -- mctx/buffers persist for the next one
        (freed only in rkmpp_hwenc_destroy). Everything past here is a plain
        software H.264 decode of the hardware encoder's own bitstream,
-       identical in spirit to cs_backend_lavc_sw's decode side. */
-    avcodec_flush_buffers(ctx->dec_ctx); /* reset DPB/reference state from
-        any previous call, same use as across a seek to an unrelated point
-        in a stream */
-
-    double t_teardown_done = timing ? now_ms() : 0; /* kept for a stable
-        TIMING line shape; this phase is now ~free (flush only) */
-
+       identical in spirit to cs_backend_lavc_sw's decode side. The shared
+       decoder flushes its DPB, feeds the stand-in IDR then the P-frame, and
+       takes ownership of bitstream_p. */
     double t_decoder_open_done = timing ? now_ms() : 0;
-
-    pkt_i = av_packet_alloc();
-    pkt_p = av_packet_alloc();
-    dec_frame = av_frame_alloc();
-    if (!pkt_i || !pkt_p || !dec_frame) goto done;
-
-    /* The stand-in IDR (persistent, owned by ctx) is copied per call rather
-       than handed over -- it's a couple of KB, so the copy is noise next to
-       the ~42ms of real-I-frame decode it replaces. */
-    if (av_new_packet(pkt_i, (int)ctx->stub_idr_len) < 0) goto done;
-    memcpy(pkt_i->data, ctx->stub_idr, ctx->stub_idr_len);
-
-    /* Takes ownership of bitstream_p (av_malloc'd with padding above) --
-       no further copy, and `done:` must not free it once this succeeds. */
-    if (av_packet_from_data(pkt_p, bitstream_p, (int)bitstream_p_len) < 0) goto done;
-    bitstream_p = NULL;
-    pkt_i->pts = 0;
-    pkt_p->pts = 1;
-
-    out->subpel_bits = 0; /* overwritten below iff a P-frame with side data is decoded */
-
-    AVPacket *dec_inputs[2] = {pkt_i, pkt_p};
-    for (int i = 0; i < 2; i++) {
-        double t_pkt_start = timing ? now_ms() : 0;
-        if (avcodec_send_packet(ctx->dec_ctx, dec_inputs[i]) < 0) goto done;
-        for (;;) {
-            int r = avcodec_receive_frame(ctx->dec_ctx, dec_frame);
-            if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) break;
-            if (r < 0) goto done;
-
-            if (dec_frame->pts == 1) {
-                AVFrameSideData *sd = av_frame_get_side_data(dec_frame, AV_FRAME_DATA_MOTION_VECTORS);
-                if (sd) {
-                    const AVMotionVector *mvs = (const AVMotionVector *)sd->data;
-                    int count = (int)(sd->size / sizeof(AVMotionVector));
-                    int subpel_bits = 0, subpel_known = 0;
-
-                    for (int j = 0; j < count; j++) {
-                        const AVMotionVector *mv = &mvs[j];
-                        if (!subpel_known && mv->motion_scale > 0) {
-                            subpel_bits = log2_pow2(mv->motion_scale, 2);
-                            subpel_known = 1;
-                        }
-
-                        int gx = mv->dst_x / ctx->block_w;
-                        int gy = mv->dst_y / ctx->block_h;
-                        if (gx < 0 || gx >= cols || gy < 0 || gy >= rows) continue;
-
-                        size_t idx = (size_t)gy * cols + gx;
-                        /* Same convention/derivation as lavc_sw: dx s.t. a
-                           LEFT-image point at x is visible in RIGHT at
-                           x+dx; src_x = dst_x + motion_x/scale with
-                           dst=RIGHT(current/P), src=LEFT(reference). */
-                        ctx->dx[idx] = (int16_t)(-mv->motion_x);
-                        ctx->dy[idx] = (int16_t)(-mv->motion_y);
-                        ctx->flags[idx] = (uint8_t)CS_BLK_NO_COST;
-                    }
-                    out->subpel_bits = subpel_bits;
-                }
-            }
-            av_frame_unref(dec_frame);
-        }
-        if (timing)
-            fprintf(stderr, "TIMING sw_decode[%d] %.3f ms (%zu bytes)\n",
-                    i, now_ms() - t_pkt_start, (size_t)dec_inputs[i]->size);
-    }
+    int subpel_bits = 0;
+    int dr = cs_h264_mvdec_extract(ctx->dec, bitstream_p, bitstream_p_len,
+                                    ctx->block_w, ctx->block_h, cols, rows,
+                                    ctx->dx, ctx->dy, ctx->flags,
+                                    &subpel_bits, timing);
+    bitstream_p = NULL; /* consumed even on failure */
+    if (dr != 0) goto done;
+    out->subpel_bits = subpel_bits;
 
     if (timing) {
         double t_all_done = now_ms();
         fprintf(stderr,
-                "TIMING mpp_setup=%.3f hw_encode_total=%.3f mpp_teardown=%.3f "
-                "decoder_open=%.3f sw_decode_total=%.3f overall=%.3f (ms)\n",
+                "TIMING mpp_setup=%.3f hw_encode_total=%.3f "
+                "sw_decode_total=%.3f overall=%.3f (ms)\n",
                 t_setup_done - t0, t_encode_done - t_setup_done,
-                t_teardown_done - t_encode_done,
-                t_decoder_open_done - t_teardown_done,
                 t_all_done - t_decoder_open_done,
                 t_all_done - t0);
     }
@@ -713,14 +622,10 @@ static int rkmpp_hwenc_extract(void *vctx, const cs_frame *left, const cs_frame 
 
 done:
     free(right_shifted);
-    /* av_malloc'd (not plain malloc) -- only still non-NULL here if
-       av_packet_from_data was never reached/failed, i.e. ownership never
-       transferred to pkt_i/pkt_p. */
-    av_free(bitstream_i);
-    av_free(bitstream_p);
-    if (pkt_i) av_packet_free(&pkt_i);
-    if (pkt_p) av_packet_free(&pkt_p);
-    if (dec_frame) av_frame_free(&dec_frame);
+    /* av_malloc'd (not plain malloc). Non-NULL here only if ownership never
+       passed to cs_h264_mvdec_extract. */
+    cs_h264_bs_free(bitstream_i);
+    cs_h264_bs_free(bitstream_p);
     /* mctx, mpi, and all MPP buffers/the decoder context persist in ctx
        for the next call -- freed only in rkmpp_hwenc_destroy(). */
     return ret;
